@@ -87,6 +87,11 @@ enum
 	MSG_WINCH	= 3,
 	MSG_REDRAW	= 4,
 	MSG_KILL	= 5,
+	/* Owner-only control messages, honored only from the 0600 main socket
+	 ** (never from guest connections). Parameters live in <session>.share;
+	 ** these packets carry no payload. */
+	MSG_SHARE	= 6,
+	MSG_UNSHARE	= 7,
 };
 
 enum
@@ -139,6 +144,11 @@ int replay_session_log(int saved_errno);
 int attach_main(int noerror);
 int master_main(char **argv, int waitattach, int dontfork);
 int push_main(void);
+
+/* Sharing. The guest listener lives in a world-traversable dir so other users
+** can reach it; SO_PEERCRED in the master is the real ACL. */
+void guest_socket_path(char *buf, size_t size, unsigned uid, const char *name);
+int notify_master(int msgtype);   /* connect to sockname, send a control packet */
 int rm_main(int all);
 int list_main(int show_all);
 int kill_main(int force);

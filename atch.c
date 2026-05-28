@@ -1,4 +1,5 @@
 #include "atch.h"
+#include <grp.h>
 
 /* Env-var name string, computed from progname at startup. */
 const char *session_envvar;
@@ -31,6 +32,19 @@ const char *session_shortname(void)
 {
 	const char *p = strrchr(sockname, '/');
 	return p ? p + 1 : sockname;
+}
+
+/*
+** Path of the share guest listener for a session owned by `uid`. Lives in
+** world-traversable /tmp (a non-root user cannot create /run/atch); the file is
+** left mode 0666 and SO_PEERCRED in the master is the real authorization.
+*/
+void guest_socket_path(char *buf, size_t size, unsigned uid, const char *name)
+{
+	const char *base = strrchr(progname, '/');
+
+	base = base ? base + 1 : progname;
+	snprintf(buf, size, "/tmp/.%s-guest.%u.%s", base, uid, name);
 }
 
 /* Returns the directory where session sockets are stored. */
@@ -718,6 +732,222 @@ static int cmd_open(char *session, int argc, char **argv)
 	return 0;
 }
 
+/*
+** atch share <session> --to <spec> [-m MINUTES] [--write]
+** Resolve the target users/groups to numeric ids, write a <session>.share
+** descriptor next to the socket, and tell the running master to arm the guest
+** listener. Read-only by default; --write (or per-target :rw) grants input.
+*/
+static int cmd_share(int argc, char **argv)
+{
+	char *spec = NULL, *name = NULL;
+	long minutes = 60;
+	int write_default = 0, i, ntargets = 0;
+	char sharepath[600], gp[256], *buf, *save, *tok;
+	struct stat st;
+	time_t expiry;
+	FILE *f;
+
+	for (i = 0; i < argc; i++) {
+		if (strcmp(argv[i], "--to") == 0 && i + 1 < argc)
+			spec = argv[++i];
+		else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc)
+			minutes = atol(argv[++i]);
+		else if (!strcmp(argv[i], "--write") || !strcmp(argv[i], "-w"))
+			write_default = 1;
+		else if (argv[i][0] != '-' && !name)
+			name = argv[i];
+		else {
+			printf("%s: share: unexpected argument '%s'\n", progname,
+			       argv[i]);
+			return 1;
+		}
+	}
+	if (!name || !spec) {
+		printf("usage: %s share <session> --to "
+		       "<user|@group[:rw|:ro]>[,...] [-m MINUTES] [--write]\n",
+		       progname);
+		return 1;
+	}
+
+	sockname = name;
+	expand_sockname();
+	if (stat(sockname, &st) < 0 || !S_ISSOCK(st.st_mode)) {
+		printf("%s: session '%s' does not exist\n", progname,
+		       session_shortname());
+		return 1;
+	}
+
+	expiry = minutes > 0 ? time(NULL) + minutes * 60 : 0;
+
+	snprintf(sharepath, sizeof(sharepath), "%s.share", sockname);
+	f = fopen(sharepath, "w");
+	if (!f) {
+		printf("%s: %s: %s\n", progname, sharepath, strerror(errno));
+		return 1;
+	}
+	fchmod(fileno(f), 0600);
+	fprintf(f, "expiry %ld\n", (long)expiry);
+
+	buf = strdup(spec);
+	if (!buf) {
+		fclose(f);
+		unlink(sharepath);
+		return 1;
+	}
+	for (tok = strtok_r(buf, ",", &save); tok;
+	     tok = strtok_r(NULL, ",", &save)) {
+		int w = write_default;
+		char *colon = strrchr(tok, ':');
+
+		if (colon) {
+			if (!strcmp(colon + 1, "rw"))
+				w = 1;
+			else if (!strcmp(colon + 1, "ro"))
+				w = 0;
+			else {
+				printf("%s: share: bad mode in '%s'\n", progname,
+				       tok);
+				goto fail;
+			}
+			*colon = '\0';
+		}
+		if (tok[0] == '@') {
+			struct group *gr = getgrnam(tok + 1);
+
+			if (!gr) {
+				printf("%s: share: unknown group '%s'\n",
+				       progname, tok + 1);
+				goto fail;
+			}
+			fprintf(f, "gid %u %d\n", (unsigned)gr->gr_gid, w);
+		} else {
+			struct passwd *pw = getpwnam(tok);
+
+			if (!pw) {
+				printf("%s: share: unknown user '%s'\n",
+				       progname, tok);
+				goto fail;
+			}
+			fprintf(f, "uid %u %d\n", (unsigned)pw->pw_uid, w);
+		}
+		ntargets++;
+	}
+	free(buf);
+	fclose(f);
+
+	if (ntargets == 0) {
+		printf("%s: share: no valid targets in --to\n", progname);
+		unlink(sharepath);
+		return 1;
+	}
+
+	if (notify_master(MSG_SHARE) != 0) {
+		unlink(sharepath);
+		return 1;
+	}
+
+	if (!quiet) {
+		guest_socket_path(gp, sizeof(gp), (unsigned)getuid(),
+				  session_shortname());
+		printf("%s: session '%s' shared to %d target(s)", progname,
+		       session_shortname(), ntargets);
+		if (expiry) {
+			char age[32];
+
+			format_age(minutes * 60, age, sizeof(age));
+			printf(", expires in %s", age);
+		}
+		printf("\n  guest socket: %s\n  others can run: %s join %s\n",
+		       gp, progname, session_shortname());
+	}
+	return 0;
+
+ fail:
+	free(buf);
+	fclose(f);
+	unlink(sharepath);
+	return 1;
+}
+
+/* atch unshare <session> — revoke a share early. */
+static int cmd_unshare(int argc, char **argv)
+{
+	char sharepath[600];
+
+	if (argc < 1) {
+		printf("usage: %s unshare <session>\n", progname);
+		return 1;
+	}
+	sockname = argv[0];
+	expand_sockname();
+	snprintf(sharepath, sizeof(sharepath), "%s.share", sockname);
+	unlink(sharepath);
+	if (notify_master(MSG_UNSHARE) != 0)
+		return 1;
+	if (!quiet)
+		printf("%s: session '%s' unshared\n", progname,
+		       session_shortname());
+	return 0;
+}
+
+/*
+** atch join <session> — attach to a session another user has shared. Discovers
+** the guest socket by scanning /tmp; the master enforces SO_PEERCRED auth.
+*/
+static int cmd_join(int argc, char **argv)
+{
+	const char *base = strrchr(progname, '/');
+	char prefix[128], found[320];
+	int nfound = 0;
+	DIR *d;
+	struct dirent *de;
+
+	base = base ? base + 1 : progname;
+	if (argc < 1) {
+		printf("usage: %s join <session>\n", progname);
+		return 1;
+	}
+
+	snprintf(prefix, sizeof(prefix), ".%s-guest.", base);
+	d = opendir("/tmp");
+	if (!d) {
+		printf("%s: /tmp: %s\n", progname, strerror(errno));
+		return 1;
+	}
+	while ((de = readdir(d)) != NULL) {
+		size_t plen = strlen(prefix);
+		const char *dot;
+
+		if (strncmp(de->d_name, prefix, plen) != 0)
+			continue;
+		/* remainder is <uid>.<name>; match the trailing name */
+		dot = strchr(de->d_name + plen, '.');
+		if (!dot || strcmp(dot + 1, argv[0]) != 0)
+			continue;
+		if (nfound == 0)
+			snprintf(found, sizeof(found), "/tmp/%s", de->d_name);
+		nfound++;
+	}
+	closedir(d);
+
+	if (nfound == 0) {
+		printf("%s: no shared session '%s' found\n", progname, argv[0]);
+		return 1;
+	}
+	if (nfound > 1) {
+		printf("%s: multiple shared sessions named '%s' (different "
+		       "owners); cannot disambiguate\n", progname, argv[0]);
+		return 1;
+	}
+
+	sockname = strdup(found);
+	save_term();
+	if (require_tty())
+		return 1;
+	return attach_main(0);
+}
+
 static void usage(void)
 {
 	printf(PACKAGE_NAME " - version %s, compiled on %s at %s.\n"
@@ -750,6 +980,13 @@ static void usage(void)
 	       "  rm      [-a] [<session>]"
 	       "\t\tRemove stale/exited session(s)\n"
 	       "    -a\t\t\t\tRemove all stale and exited sessions\n"
+	       "  share   <session> --to <spec> [-m MIN] [--write]\n"
+	       "\t\t\t\tShare a session (read-only by default)\n"
+	       "    --to <user|@group[:rw|:ro]>[,...]\tGrant targets\n"
+	       "    -m <minutes>\t\tAuto-revoke after MIN (0 = never; default 60)\n"
+	       "    --write\t\t\tGrant input to all targets by default\n"
+	       "  join    <session>\t\t\tAttach to a session shared with you\n"
+	       "  unshare <session>\t\t\tRevoke a share early\n"
 	       "  current\t\t\t\tPrint current session name\n"
 	       "\n"
 	       "Options:\n"
@@ -937,6 +1174,12 @@ int main(int argc, char **argv)
 		return cmd_tail(argc, argv);
 	if (is_cmd(cmd, "rm", NULL, NULL))
 		return cmd_rm(argc, argv);
+	if (is_cmd(cmd, "share", NULL, NULL))
+		return cmd_share(argc, argv);
+	if (is_cmd(cmd, "join", "j", NULL))
+		return cmd_join(argc, argv);
+	if (is_cmd(cmd, "unshare", NULL, NULL))
+		return cmd_unshare(argc, argv);
 
 	/* Smart default: treat first arg as session name → attach-or-create */
 	return cmd_open((char *)cmd, argc, argv);

@@ -802,7 +802,113 @@ run "$ATCH" rm -a extra
 assert_exit     "rm -a: extra arg → exit 1"          1 "$rc"
 assert_contains "rm -a: extra arg → message"         "Invalid number of arguments" "$out"
 
-# ── 23. no-args → usage ──────────────────────────────────────────────────────
+# ── 23. share / join / unshare ────────────────────────────────────────────────
+# SO_PEERCRED cross-user accept/reject and the read-only MSG_PUSH drop require a
+# second uid and an interactive attach, so they live in a manual recipe (see the
+# share docs); the suite here covers arg parsing, the descriptor file, the guest
+# listener lifecycle, and join's /tmp discovery scan (headless: a found socket
+# falls through to the no-tty check, a miss reports "no shared session").
+
+ME=$(id -un)
+MYUID=$(id -u)
+GUEST_SOCK="/tmp/.atch-guest.${MYUID}.s-share"
+
+# Wait until a path appears / disappears (up to 1 s); the master arms/revokes
+# the guest listener asynchronously after the share/unshare control packet.
+wait_path() { local i=0; while [ $i -lt 20 ]; do [ -e "$1" ] && return 0; sleep 0.05; i=$((i + 1)); done; return 1; }
+wait_gone() { local i=0; while [ $i -lt 20 ]; do [ -e "$1" ] || return 0; sleep 0.05; i=$((i + 1)); done; return 1; }
+
+# share: no arguments → usage
+run "$ATCH" share
+assert_exit     "share: no args → exit 1"            1 "$rc"
+assert_contains "share: no args → usage"             "usage" "$out"
+
+# share: nonexistent session
+run "$ATCH" share s-noexist-share --to "$ME"
+assert_exit     "share: nonexistent → exit 1"        1 "$rc"
+assert_contains "share: nonexistent → message"       "does not exist" "$out"
+
+# share: missing --to
+"$ATCH" start s-share sleep 999
+wait_socket s-share
+run "$ATCH" share s-share
+assert_exit     "share: missing --to → exit 1"       1 "$rc"
+assert_contains "share: missing --to → usage"        "usage" "$out"
+
+# share: unknown user
+run "$ATCH" share s-share --to __atch_no_such_user__
+assert_exit     "share: unknown user → exit 1"       1 "$rc"
+assert_contains "share: unknown user → message"      "unknown user" "$out"
+
+# share: unknown group
+run "$ATCH" share s-share --to "@__atch_no_such_group__"
+assert_exit     "share: unknown group → exit 1"      1 "$rc"
+assert_contains "share: unknown group → message"     "unknown group" "$out"
+
+# share: bad per-target mode
+run "$ATCH" share s-share --to "${ME}:bogus"
+assert_exit     "share: bad mode → exit 1"           1 "$rc"
+assert_contains "share: bad mode → message"          "bad mode" "$out"
+
+# share: valid target (self), read-only by default, no expiry (-m 0)
+run "$ATCH" share s-share --to "$ME" -m 0
+assert_exit     "share: valid → exit 0"              0 "$rc"
+assert_contains "share: valid → confirmation"        "shared to 1 target" "$out"
+if [ -f "$HOME/.cache/atch/s-share.share" ]; then
+    ok "share: .share descriptor written"
+else
+    fail "share: .share descriptor written" "exists" "missing"
+fi
+if wait_path "$GUEST_SOCK" && [ -S "$GUEST_SOCK" ]; then
+    ok "share: guest listener armed"
+else
+    fail "share: guest listener armed" "socket" "missing"
+fi
+
+# join: discovers the shared session (blocked only by the missing TTY here)
+run "$ATCH" join s-share
+assert_exit     "join: found → exit 1 (no tty)"      1 "$rc"
+assert_contains "join: found → reaches tty check"    "requires a terminal" "$out"
+
+# join: no such shared session
+run "$ATCH" join s-noexist-join
+assert_exit     "join: not found → exit 1"           1 "$rc"
+assert_contains "join: not found → message"          "no shared session" "$out"
+
+# share: re-share read-write (per-target :rw) re-arms cleanly
+run "$ATCH" share s-share --to "${ME}:rw"
+assert_exit     "share: re-share :rw → exit 0"       0 "$rc"
+assert_contains "share: re-share :rw → confirmation" "shared to 1 target" "$out"
+
+# unshare: revoke the share
+run "$ATCH" unshare s-share
+assert_exit     "unshare: exits 0"                   0 "$rc"
+assert_contains "unshare: confirmation"              "unshared" "$out"
+if wait_gone "$GUEST_SOCK"; then
+    ok "unshare: guest listener torn down"
+else
+    fail "unshare: guest listener torn down" "gone" "still exists"
+fi
+if [ -e "$HOME/.cache/atch/s-share.share" ]; then
+    fail "unshare: descriptor removed" "gone" "still exists"
+else
+    ok "unshare: descriptor removed"
+fi
+
+# join: after unshare the session is no longer discoverable
+run "$ATCH" join s-share
+assert_exit     "join: after unshare → exit 1"       1 "$rc"
+assert_contains "join: after unshare → not found"    "no shared session" "$out"
+
+# unshare: no arguments → usage
+run "$ATCH" unshare
+assert_exit     "unshare: no args → exit 1"          1 "$rc"
+assert_contains "unshare: no args → usage"           "usage" "$out"
+
+tidy s-share
+rm -f "$HOME/.cache/atch/s-share.log" "$GUEST_SOCK"
+
+# ── 24. no-args → usage ──────────────────────────────────────────────────────
 
 # Invoking with zero arguments calls usage() (exits 0, prints help).
 # We already consumed the binary name in main, so argc < 1 → usage().
@@ -814,6 +920,9 @@ assert_contains "no args: shows Usage:"              "Usage:" "$out"
 run "$ATCH" --help
 assert_contains "help: shows tail command"           "tail" "$out"
 assert_contains "help: shows rm command"             "rm" "$out"
+assert_contains "help: shows share command"          "share" "$out"
+assert_contains "help: shows join command"           "join" "$out"
+assert_contains "help: shows unshare command"        "unshare" "$out"
 
 # ── summary ──────────────────────────────────────────────────────────────────
 

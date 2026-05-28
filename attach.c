@@ -509,6 +509,34 @@ int push_main()
 	}
 }
 
+/*
+** Connect to the session's main socket and send a single payload-less control
+** packet (MSG_SHARE / MSG_UNSHARE). Used by the owner to (re)arm or revoke a
+** share; the master reads the parameters from <session>.share.
+*/
+int notify_master(int msgtype)
+{
+	struct packet pkt;
+	int s;
+
+	s = connect_socket(sockname);
+	if (s < 0) {
+		printf("%s: %s: %s\n", progname, sockname, strerror(errno));
+		return 1;
+	}
+	signal(SIGPIPE, SIG_IGN);
+	memset(&pkt, 0, sizeof(pkt));
+	pkt.type = msgtype;
+	pkt.len = 0;
+	if (write(s, &pkt, sizeof(struct packet)) != sizeof(struct packet)) {
+		printf("%s: %s: %s\n", progname, sockname, strerror(errno));
+		close(s);
+		return 1;
+	}
+	close(s);
+	return 0;
+}
+
 static int send_kill(int sig)
 {
 	struct packet pkt;

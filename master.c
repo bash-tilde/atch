@@ -1,4 +1,11 @@
+/* struct ucred / SO_PEERCRED need _GNU_SOURCE on glibc (and musl). Must precede
+** any system header, so it goes above atch.h which pulls in <sys/socket.h>. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "atch.h"
+#include <grp.h>
+#include <stdarg.h>
 
 /* The pty struct - The pty information is stored here. */
 struct pty {
@@ -32,6 +39,12 @@ struct client {
 	 ** the 0600 main socket and is never read-only; only the share guest
 	 ** listener sets this (see SO_PEERCRED auth). */
 	int read_only;
+	/* Connected via the share guest listener (vs the owner's main socket).
+	 ** Guests are dropped when a share is revoked and may not issue
+	 ** owner-only control messages (MSG_SHARE/MSG_UNSHARE). */
+	int is_guest;
+	/* SO_PEERCRED identity of a guest, for audit logging. */
+	unsigned guest_uid;
 	/* Scrollback replay state: physical ring index and bytes remaining. */
 	size_t replay_head;
 	size_t replay_remaining;
@@ -52,6 +65,79 @@ size_t log_max_size = LOG_MAX_SIZE;
 static unsigned char scrollback_buf[SCROLLBACK_SIZE];
 static size_t scrollback_head;	/* physical index of the oldest byte */
 static size_t scrollback_len;	/* number of valid bytes, 0..SCROLLBACK_SIZE */
+
+/*
+** Sharing state. The guest listener is a second unix socket in a
+** world-traversable directory so other users can connect; SO_PEERCRED is the
+** real authorization. All of this is zero/closed when no share is active.
+*/
+#define MAX_GRANTS 64
+struct grant {
+	int is_group;		/* 0 = uid match, 1 = gid match */
+	unsigned id;		/* the uid or gid */
+	int write;		/* 1 = read-write, 0 = read-only */
+};
+static struct grant grants[MAX_GRANTS];
+static int ngrants;
+static int guest_fd = -1;		/* guest listener, -1 when not sharing */
+static char guest_path[256];		/* filesystem path of the guest socket */
+static time_t share_expiry;		/* absolute expiry; 0 = no expiry */
+
+/* Append an audit line to the on-disk session log (best-effort). */
+static void audit_log(const char *fmt, ...)
+{
+	char line[256];
+	va_list ap;
+	int n;
+
+	if (log_fd < 0)
+		return;
+	va_start(ap, fmt);
+	n = vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	if (n > 0)
+		write(log_fd, line, strlen(line));
+}
+
+/*
+** Decide whether a peer (from SO_PEERCRED) is allowed in, and whether with
+** write access. Returns 1 if authorized (and sets *write_out), 0 otherwise.
+** Group grants match the peer's primary gid and any supplementary group.
+*/
+static int guest_authorize(unsigned uid, unsigned gid, int *write_out)
+{
+	int i;
+	struct passwd *pw;
+
+	for (i = 0; i < ngrants; i++)
+		if (!grants[i].is_group && grants[i].id == uid) {
+			*write_out = grants[i].write;
+			return 1;
+		}
+	for (i = 0; i < ngrants; i++)
+		if (grants[i].is_group && grants[i].id == gid) {
+			*write_out = grants[i].write;
+			return 1;
+		}
+
+	/* Supplementary groups: resolve the peer's full group list by name. */
+	pw = getpwuid((uid_t) uid);
+	if (pw) {
+		gid_t gl[64];
+		int ng = (int)(sizeof(gl) / sizeof(gl[0]));
+		if (getgrouplist(pw->pw_name, (gid_t) gid, gl, &ng) >= 0) {
+			int j;
+			for (i = 0; i < ngrants; i++)
+				if (grants[i].is_group)
+					for (j = 0; j < ng; j++)
+						if ((unsigned)gl[j] == grants[i].id) {
+							*write_out = grants[i].write;
+							return 1;
+						}
+		}
+	}
+	return 0;
+}
 
 /*
 ** Trim log_fd to its last LOG_MAX_SIZE bytes, then seek to the end.
@@ -113,6 +199,12 @@ static void cleanup_session(void)
 		close(log_fd);
 		log_fd = -1;
 	}
+	if (guest_fd >= 0) {
+		close(guest_fd);
+		guest_fd = -1;
+	}
+	if (guest_path[0])
+		unlink(guest_path);
 	unlink(sockname);
 }
 
@@ -296,6 +388,143 @@ static void update_socket_modes(int exec)
 		chmod(sockname, newmode);
 }
 
+/*
+** Create the guest listener socket in a world-traversable directory. The file
+** is left mode 0666 on purpose: any user may connect(), and SO_PEERCRED auth
+** in accept_client() decides who is actually let in. Returns the fd, or -1.
+*/
+static int create_guest_socket(const char *path)
+{
+	int s;
+	struct sockaddr_un sockun;
+	mode_t omask;
+
+	if (strlen(path) > sizeof(sockun.sun_path) - 1) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	/* Clear a stale socket left by a previous run of ours. unlink() of
+	 ** another user's file in a sticky dir fails harmlessly. */
+	unlink(path);
+
+	omask = umask(0);
+	s = socket(PF_UNIX, SOCK_STREAM, 0);
+	if (s < 0) {
+		umask(omask);
+		return -1;
+	}
+	sockun.sun_family = AF_UNIX;
+	memcpy(sockun.sun_path, path, strlen(path) + 1);
+	if (bind(s, (struct sockaddr *)&sockun, sizeof(sockun)) < 0 ||
+	    listen(s, 128) < 0 || setnonblocking(s) < 0) {
+		umask(omask);
+		close(s);
+		return -1;
+	}
+	umask(omask);
+	chmod(path, 0666);
+	return s;
+}
+
+/* Drop every guest client from the list (used when revoking a share). */
+static void drop_guest_clients(void)
+{
+	struct client *p = clients, *next;
+
+	while (p) {
+		next = p->next;
+		if (p->is_guest) {
+			close(p->fd);
+			if (p->next)
+				p->next->pprev = p->pprev;
+			*(p->pprev) = p->next;
+			free(p);
+		}
+		p = next;
+	}
+}
+
+/* Tear down an active share: close the listener, unlink it, drop guests. */
+static void revoke_share(void)
+{
+	if (guest_fd < 0)
+		return;
+	close(guest_fd);
+	guest_fd = -1;
+	if (guest_path[0])
+		unlink(guest_path);
+	drop_guest_clients();
+	ngrants = 0;
+	share_expiry = 0;
+	audit_log("\r\n[%s: session '%s' share revoked]\r\n", progname,
+		  session_shortname());
+}
+
+/*
+** (Re)load the share descriptor written by `atch share` and (re)arm the guest
+** listener. The file lives next to the session socket and is owner-only.
+** Format: "expiry <epoch>" then "uid <n> <0|1>" / "gid <n> <0|1>" lines.
+*/
+static void load_share(void)
+{
+	char path[600];
+	FILE *f;
+	char line[128];
+	int n_rw = 0;
+
+	snprintf(path, sizeof(path), "%s.share", sockname);
+	f = fopen(path, "r");
+	if (!f)
+		return;
+
+	ngrants = 0;
+	share_expiry = 0;
+	while (fgets(line, sizeof(line), f)) {
+		unsigned id;
+		int w;
+		long e;
+
+		if (sscanf(line, "expiry %ld", &e) == 1) {
+			share_expiry = (time_t) e;
+		} else if (sscanf(line, "uid %u %d", &id, &w) == 2 &&
+			   ngrants < MAX_GRANTS) {
+			grants[ngrants].is_group = 0;
+			grants[ngrants].id = id;
+			grants[ngrants].write = w ? 1 : 0;
+			n_rw += grants[ngrants].write;
+			ngrants++;
+		} else if (sscanf(line, "gid %u %d", &id, &w) == 2 &&
+			   ngrants < MAX_GRANTS) {
+			grants[ngrants].is_group = 1;
+			grants[ngrants].id = id;
+			grants[ngrants].write = w ? 1 : 0;
+			n_rw += grants[ngrants].write;
+			ngrants++;
+		}
+	}
+	fclose(f);
+
+	if (ngrants == 0) {
+		revoke_share();
+		return;
+	}
+
+	/* Open the listener if not already up. */
+	if (guest_fd < 0) {
+		guest_socket_path(guest_path, sizeof(guest_path),
+				  (unsigned)getuid(), session_shortname());
+		guest_fd = create_guest_socket(guest_path);
+		if (guest_fd < 0) {
+			audit_log("\r\n[%s: share failed: %s: %s]\r\n", progname,
+				  guest_path, strerror(errno));
+			ngrants = 0;
+			return;
+		}
+	}
+	audit_log("\r\n[%s: session '%s' shared, %d grant(s), %d writable]\r\n",
+		  progname, session_shortname(), ngrants, n_rw);
+}
+
 /* Append len bytes from buf to the scrollback ring buffer.
 ** If the buffer is full, the oldest bytes are overwritten. */
 static void scrollback_append(const unsigned char *buf, size_t len)
@@ -469,16 +698,43 @@ static void pty_activity(int s)
 }
 
 /* Process activity on the control socket */
-static void control_activity(int s)
+static void accept_client(int listen_fd, int is_guest)
 {
 	int fd;
+	int read_only = 0;
+	unsigned uid = 0;
 	struct client *p;
 
 	/* Accept the new client and link it in. */
-	fd = accept(s, NULL, NULL);
+	fd = accept(listen_fd, NULL, NULL);
 	if (fd < 0)
 		return;
-	else if (setnonblocking(fd) < 0) {
+
+	/* Guests must pass SO_PEERCRED authorization. The owner connects on
+	 ** the 0600 main socket and is trusted by filesystem permissions. */
+	if (is_guest) {
+		struct ucred cred;
+		socklen_t clen = sizeof(cred);
+		int write = 0;
+
+		if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) < 0) {
+			close(fd);
+			return;
+		}
+		if (!guest_authorize((unsigned)cred.uid, (unsigned)cred.gid,
+				     &write)) {
+			audit_log("\r\n[%s: guest uid=%u rejected]\r\n", progname,
+				  (unsigned)cred.uid);
+			close(fd);
+			return;
+		}
+		read_only = !write;
+		uid = (unsigned)cred.uid;
+		audit_log("\r\n[%s: guest uid=%u joined %s]\r\n", progname, uid,
+			  read_only ? "read-only" : "read-write");
+	}
+
+	if (setnonblocking(fd) < 0) {
 		close(fd);
 		return;
 	}
@@ -491,7 +747,9 @@ static void control_activity(int s)
 	}
 	p->fd = fd;
 	p->attached = 0;
-	p->read_only = 0;
+	p->read_only = read_only;
+	p->is_guest = is_guest;
+	p->guest_uid = uid;
 	p->replay_head = 0;
 	p->replay_remaining = 0;
 	p->pprev = &clients;
@@ -582,6 +840,16 @@ static void client_activity(struct client *p)
 			killpty(&the_pty, sig);
 		}
 	}
+
+	/* Owner-only share control. Honored only on the 0600 main socket; a
+	 ** guest cannot grant or revoke access to the session. */
+	else if (pkt.type == MSG_SHARE) {
+		if (!p->is_guest)
+			load_share();
+	} else if (pkt.type == MSG_UNSHARE) {
+		if (!p->is_guest)
+			revoke_share();
+	}
 }
 
 /* The master process - It watches over the pty process and the attached */
@@ -641,11 +909,20 @@ static void master_process(int s, char **argv, int waitattach, int statusfd)
 	while (1) {
 		int new_has_attached_client = 0;
 
+		struct timeval tv, *ptv = NULL;
+
 		/* Re-initialize the file descriptor sets for select. */
 		FD_ZERO(&readfds);
 		FD_ZERO(&writefds);
 		FD_SET(s, &readfds);
 		highest_fd = s;
+
+		/* Watch the guest listener too, while a share is active. */
+		if (guest_fd >= 0) {
+			FD_SET(guest_fd, &readfds);
+			if (guest_fd > highest_fd)
+				highest_fd = guest_fd;
+		}
 
 		/*
 		 ** When waitattach is set, wait until the client attaches
@@ -681,16 +958,40 @@ static void master_process(int s, char **argv, int waitattach, int statusfd)
 			has_attached_client = new_has_attached_client;
 		}
 
+		/*
+		 ** Arm a timeout so a timed share can expire even when nothing
+		 ** else is happening. Revoke immediately if already past due.
+		 */
+		if (guest_fd >= 0 && share_expiry > 0) {
+			time_t now = time(NULL);
+
+			if (now >= share_expiry) {
+				revoke_share();
+			} else {
+				tv.tv_sec = share_expiry - now;
+				tv.tv_usec = 0;
+				ptv = &tv;
+			}
+		}
+
 		/* Wait for something to happen. */
-		if (select(highest_fd + 1, &readfds, &writefds, NULL, NULL) < 0) {
+		if (select(highest_fd + 1, &readfds, &writefds, NULL, ptv) < 0) {
 			if (errno == EINTR || errno == EAGAIN)
 				continue;
 			exit(1);
 		}
 
-		/* New client? */
+		/* Expire a timed share whose deadline has now passed. */
+		if (guest_fd >= 0 && share_expiry > 0
+		    && time(NULL) >= share_expiry)
+			revoke_share();
+
+		/* New client on the owner's socket? */
 		if (FD_ISSET(s, &readfds))
-			control_activity(s);
+			accept_client(s, 0);
+		/* New guest on the share listener? */
+		if (guest_fd >= 0 && FD_ISSET(guest_fd, &readfds))
+			accept_client(guest_fd, 1);
 		/* Activity on a client? */
 		for (p = clients; p; p = next) {
 			next = p->next;
