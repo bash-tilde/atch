@@ -27,6 +27,11 @@ struct client {
 	int fd;
 	/* Whether or not the client is attached. */
 	int attached;
+	/* Read-only guest: its MSG_PUSH/MSG_KILL packets are dropped so it
+	 ** cannot inject keystrokes or signal the child. The owner connects on
+	 ** the 0600 main socket and is never read-only; only the share guest
+	 ** listener sets this (see SO_PEERCRED auth). */
+	int read_only;
 	/* Scrollback replay state: physical ring index and bytes remaining. */
 	size_t replay_head;
 	size_t replay_remaining;
@@ -486,6 +491,7 @@ static void control_activity(int s)
 	}
 	p->fd = fd;
 	p->attached = 0;
+	p->read_only = 0;
 	p->replay_head = 0;
 	p->replay_remaining = 0;
 	p->pprev = &clients;
@@ -516,9 +522,10 @@ static void client_activity(struct client *p)
 		return;
 	}
 
-	/* Push out data to the program. */
+	/* Push out data to the program. Read-only guests are silently
+	 ** ignored so they cannot inject keystrokes into the session. */
 	if (pkt.type == MSG_PUSH) {
-		if (pkt.len <= sizeof(pkt.u.buf))
+		if (!p->read_only && pkt.len <= sizeof(pkt.u.buf))
 			write_buf_or_fail(the_pty.fd, pkt.u.buf, pkt.len);
 	}
 
@@ -568,10 +575,12 @@ static void client_activity(struct client *p)
 		}
 	}
 
-	/* Send a signal to the child process. */
+	/* Send a signal to the child process. Denied to read-only guests. */
 	else if (pkt.type == MSG_KILL) {
-		int sig = pkt.len ? (int)(unsigned char)pkt.len : SIGTERM;
-		killpty(&the_pty, sig);
+		if (!p->read_only) {
+			int sig = pkt.len ? (int)(unsigned char)pkt.len : SIGTERM;
+			killpty(&the_pty, sig);
+		}
 	}
 }
 
