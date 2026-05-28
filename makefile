@@ -4,6 +4,18 @@ CFLAGS = -g -O2 -W -Wall -I. -DPACKAGE_VERSION=\"$(VERSION)\"
 LDFLAGS =
 LIBS = -lutil
 
+# Portable musl static deploy artifact (~84 KB stripped) — what ships to remote
+# hosts. musl bundles forkpty/openpty in libc, so -lutil is omitted (a native
+# musl-gcc has no libutil stub, unlike Alpine). Override MUSL_CC=gcc inside an
+# Alpine/musl container, where the system gcc already targets musl.
+MUSL_CC ?= musl-gcc
+# Arch's gcc spec leaks a phantom -latomic_asneeded into musl-gcc static links
+# unless -fno-link-libatomic is passed; vanilla gcc (Alpine) rejects that flag.
+# Probe the chosen compiler and use it only when accepted. Lazily expanded (=),
+# so this only runs for the `musl` target, not the default glibc build.
+MUSL_NOATOMIC = $(shell $(MUSL_CC) -fno-link-libatomic -E -x c /dev/null >/dev/null 2>&1 && echo -fno-link-libatomic)
+MUSL_CFLAGS = -Os -static -s $(MUSL_NOATOMIC) -I. -DPACKAGE_VERSION=\"$(VERSION)\"
+
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
   STATIC_FLAG =
@@ -22,6 +34,14 @@ arch ?= $(shell arch)
 
 atch: $(OBJ)
 	$(CC) -o $(BUILDDIR)/$@ $(STATIC_FLAG) $(LDFLAGS) $(OBJ) $(LIBS)
+
+# Build the portable musl static binary directly from source in one pass.
+#   make musl                 -> ./atch    (needs musl-gcc; Arch: pacman -S musl)
+#   make musl BUILDDIR=build  -> build/atch
+#   make musl MUSL_CC=gcc     -> inside an Alpine/musl container
+.PHONY: musl
+musl:
+	$(MUSL_CC) $(MUSL_CFLAGS) -o $(BUILDDIR)/atch $(SRC)
 
 atch.1.md: README.md scripts/readme2man.sh
 	bash scripts/readme2man.sh $< > $@
