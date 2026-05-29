@@ -281,6 +281,8 @@ int clear_method = CLEAR_UNSPEC;
 int quiet = 0;
 /* 1 if we should not send ansi sequences to the terminal */
 int no_ansiterm = 0;
+/* Remote host from -H HOST, or NULL for a local session. */
+char *remote_host = NULL;
 
 /*
 ** The original terminal settings. Shared between the master and attach
@@ -333,7 +335,19 @@ static int parse_options(int *argc, char ***argv)
 		for (p = (*argv)[0] + 1; *p; ++p) {
 			if (*p == 'E')
 				detach_char = -1;
-			else if (*p == 'z')
+			else if (*p == 'H') {
+				++(*argv);
+				--(*argc);
+				if (*argc < 1) {
+					printf("%s: No remote host "
+					       "specified.\n", progname);
+					printf("Try '%s --help' for more "
+					       "information.\n", progname);
+					return 1;
+				}
+				remote_host = (*argv)[0];
+				break;
+			} else if (*p == 'z')
 				no_suspend = 1;
 			else if (*p == 'q')
 				quiet = 1;
@@ -872,8 +886,18 @@ static int cmd_rm(int argc, char **argv)
 }
 
 /* Default: atch <session> [cmd...] — attach-or-create */
+/* Remote bootstrap/attach orchestrator, defined below. */
+static int remote_main(const char *host, const char *name);
+
 static int cmd_open(char *session, int argc, char **argv)
 {
+	struct regentry e;
+
+	/* Bare name that resolves in the registry → remote session. Skipped
+	 ** under the relay, which must run the session on the local host. */
+	if (!remote_host && !getenv("ATCH_RELAY") && registry_lookup(session, &e))
+		return remote_main(NULL, session);
+
 	sockname = session;
 	expand_sockname();
 	if (parse_options(&argc, &argv))
@@ -988,6 +1012,344 @@ static int cmd_remote(int argc, char **argv)
 
 	printf("%s: remote: unknown subcommand '%s'\n", progname, argv[0]);
 	return 1;
+}
+
+/* ───────── Remote bootstrap & attach (spec items 5 & 6) ────────────────────
+** No stored credentials: first contact reuses the user's own ssh; a dedicated
+** ed25519 key (~/.config/<prog>/id_ed25519) drives every later connect. The
+** remote runs the staged static binary behind a restricted forced-command
+** authorized_keys line (`restrict,pty,command="<atch> --relay"`). Host keys
+** are pinned in a private known_hosts (TOFU on first sight; ssh refuses a
+** changed key) and the SHA256 fingerprint is recorded in the registry.
+*/
+
+/* Conservative host syntax check: [user@]host[:port]-ish, no shell metachars.
+** ssh is exec'd directly (no local shell), but the host also lands in popen()
+** strings for fingerprinting, so keep it strict. */
+static int valid_host(const char *h)
+{
+	const char *p;
+
+	if (!h || !*h)
+		return 0;
+	for (p = h; *p; p++) {
+		char c = *p;
+
+		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		    (c >= '0' && c <= '9') || c == '.' || c == '-' ||
+		    c == '_' || c == '@' || c == ':')
+			continue;
+		return 0;
+	}
+	return 1;
+}
+
+/* Lazily create the dedicated ed25519 identity. Fills keypath. 0 on success. */
+static int ensure_identity_key(char *keypath, size_t size)
+{
+	char dir[512], cmd[1400];
+	struct stat st;
+
+	get_config_dir(dir, sizeof(dir));
+	snprintf(keypath, size, "%s/id_ed25519", dir);
+	if (stat(keypath, &st) == 0)
+		return 0;
+	if (ensure_config_dir() < 0) {
+		printf("%s: %s: %s\n", progname, dir, strerror(errno));
+		return -1;
+	}
+	snprintf(cmd, sizeof(cmd),
+		 "ssh-keygen -q -t ed25519 -N '' -C atch-relay -f '%s' </dev/null",
+		 keypath);
+	if (system(cmd) != 0 || stat(keypath, &st) != 0) {
+		printf("%s: could not generate identity key with ssh-keygen\n",
+		       progname);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+** Run ssh to `host`. identity != NULL pins that key (IdentitiesOnly). tty: 0
+** none, 1 = -t, 2 = -tt. stdin_path != NULL feeds the remote command's stdin
+** from that file. remote_cmd is sent verbatim (NULL = interactive shell). All
+** sessions use a private known_hosts with accept-new (TOFU + change refusal).
+** Returns the ssh exit status, or -1 on spawn failure.
+*/
+static int run_ssh(const char *host, const char *identity, int tty,
+		   const char *stdin_path, const char *remote_cmd)
+{
+	char dir[512], khopt[640];
+	char *argv[24];
+	int n = 0, status, infd = -1;
+	pid_t pid;
+
+	get_config_dir(dir, sizeof(dir));
+	snprintf(khopt, sizeof(khopt), "UserKnownHostsFile=%s/known_hosts", dir);
+
+	argv[n++] = "ssh";
+	argv[n++] = "-o";
+	argv[n++] = khopt;
+	argv[n++] = "-o";
+	argv[n++] = "StrictHostKeyChecking=accept-new";
+	argv[n++] = (tty == 2) ? "-tt" : (tty == 1) ? "-t" : "-T";
+	if (identity) {
+		argv[n++] = "-i";
+		argv[n++] = (char *)identity;
+		argv[n++] = "-o";
+		argv[n++] = "IdentitiesOnly=yes";
+	}
+	argv[n++] = (char *)host;
+	if (remote_cmd)
+		argv[n++] = (char *)remote_cmd;
+	argv[n] = NULL;
+
+	if (stdin_path) {
+		infd = open(stdin_path, O_RDONLY);
+		if (infd < 0) {
+			printf("%s: %s: %s\n", progname, stdin_path,
+			       strerror(errno));
+			return -1;
+		}
+	}
+	pid = fork();
+	if (pid < 0) {
+		if (infd >= 0)
+			close(infd);
+		return -1;
+	}
+	if (pid == 0) {
+		if (infd >= 0) {
+			dup2(infd, 0);
+			close(infd);
+		}
+		execvp("ssh", argv);
+		_exit(127);
+	}
+	if (infd >= 0)
+		close(infd);
+	if (waitpid(pid, &status, 0) < 0)
+		return -1;
+	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/*
+** First-contact bootstrap over the user's own ssh: install the dedicated key
+** with a restricted forced-command line (idempotent) and stage this very
+** binary into the remote ~/.cache/atch/atch. Returns 0 on success.
+*/
+static int install_key_and_stage(const char *host, const char *keypath)
+{
+	char pubpath[680], self[512], setup[3072];
+	char *pubkey, *blob, *sp;
+	FILE *pf;
+	size_t n;
+	ssize_t sl;
+	int rc;
+
+	/* Read our public key (single line). */
+	snprintf(pubpath, sizeof(pubpath), "%s.pub", keypath);
+	pf = fopen(pubpath, "r");
+	if (!pf) {
+		printf("%s: %s: %s\n", progname, pubpath, strerror(errno));
+		return -1;
+	}
+	pubkey = malloc(2048);
+	n = pubkey ? fread(pubkey, 1, 2047, pf) : 0;
+	fclose(pf);
+	if (!pubkey || n == 0) {
+		free(pubkey);
+		printf("%s: empty public key\n", progname);
+		return -1;
+	}
+	pubkey[n] = '\0';
+	while (n && (pubkey[n - 1] == '\n' || pubkey[n - 1] == '\r'))
+		pubkey[--n] = '\0';
+
+	/* Field 2 (the base64 blob) uniquely identifies the key for idempotent
+	 ** install — the comment may legitimately differ. */
+	blob = strchr(pubkey, ' ');
+	blob = blob ? blob + 1 : pubkey;
+	sp = strchr(blob, ' ');
+	if (sp)
+		*sp = '\0';
+
+	/* The remote command is run by the remote login shell (one shell layer;
+	 ** ssh is exec'd without a local shell). $HOME expands remotely so the
+	 ** forced command is absolute; \" escapes the inner quotes. */
+	snprintf(setup, sizeof(setup),
+		 "umask 077; mkdir -p ~/.ssh ~/.cache/atch; "
+		 "touch ~/.ssh/authorized_keys; "
+		 "grep -qF '%s' ~/.ssh/authorized_keys || "
+		 "echo \"restrict,pty,command=\\\"$HOME/.cache/atch/atch "
+		 "--relay\\\" %s\" >> ~/.ssh/authorized_keys",
+		 blob, pubkey);
+	free(pubkey);
+
+	rc = run_ssh(host, NULL, 0, NULL, setup);
+	if (rc != 0) {
+		printf("%s: key install failed (ssh exit %d)\n", progname, rc);
+		return -1;
+	}
+
+	/* Stage this binary. */
+	sl = readlink("/proc/self/exe", self, sizeof(self) - 1);
+	if (sl <= 0) {
+		printf("%s: cannot locate own binary to stage\n", progname);
+		return -1;
+	}
+	self[sl] = '\0';
+	rc = run_ssh(host, NULL, 0, self,
+		     "cat > ~/.cache/atch/atch.tmp && "
+		     "chmod 755 ~/.cache/atch/atch.tmp && "
+		     "mv ~/.cache/atch/atch.tmp ~/.cache/atch/atch");
+	if (rc != 0) {
+		printf("%s: binary staging failed (ssh exit %d)\n", progname,
+		       rc);
+		return -1;
+	}
+	return 0;
+}
+
+/* Read the pinned host's SHA256 fingerprint from our known_hosts (after a
+** connection has populated it). Returns 0 and fills fp ("SHA256:..."), else -1. */
+static int pinned_fingerprint(const char *host, char *fp, size_t size)
+{
+	char dir[512], cmd[1400], line[512];
+	FILE *p;
+	int ok = 0;
+
+	get_config_dir(dir, sizeof(dir));
+	snprintf(cmd, sizeof(cmd),
+		 "ssh-keygen -F %s -l -f '%s/known_hosts' 2>/dev/null", host,
+		 dir);
+	p = popen(cmd, "r");
+	if (!p)
+		return -1;
+	/* `ssh-keygen -l -F` emits a "# Host ... found" comment line before the
+	 ** "256 SHA256:... host (ED25519)" line, so scan every token for the
+	 ** fingerprint rather than assuming a fixed column on the first line. */
+	while (!ok && fgets(line, sizeof(line), p)) {
+		char *tok, *save;
+
+		if (line[0] == '#')
+			continue;
+		for (tok = strtok_r(line, " \t\r\n", &save); tok;
+		     tok = strtok_r(NULL, " \t\r\n", &save))
+			if (strncmp(tok, "SHA256:", 7) == 0) {
+				snprintf(fp, size, "%s", tok);
+				ok = 1;
+				break;
+			}
+	}
+	pclose(p);
+	return ok ? 0 : -1;
+}
+
+/*
+** Drive a remote session. With -H (remote_host set) this (re)bootstraps the
+** host, then attaches; a bare name that resolved in the registry skips
+** straight to attach using the stored host/key/fingerprint. Host-key change
+** between a stored pin and what we now observe is refused (item 6).
+*/
+static int remote_main(const char *host, const char *name)
+{
+	char keypath[600], fp[256] = "";
+	struct regentry e;
+	int have_reg, bootstrap = (remote_host != NULL);
+	const char *target;
+
+	have_reg = registry_lookup(name, &e);
+	target = host ? host : (have_reg ? e.host : NULL);
+	if (!target) {
+		printf("%s: no remote host known for '%s' (use -H HOST)\n",
+		       progname, name);
+		return 1;
+	}
+	if (!valid_host(target)) {
+		printf("%s: invalid remote host '%s'\n", progname, target);
+		return 1;
+	}
+	if (ensure_identity_key(keypath, sizeof(keypath)) < 0)
+		return 1;
+
+	if (bootstrap) {
+		if (!quiet)
+			printf("%s: bootstrapping %s ...\n", progname, target);
+		if (install_key_and_stage(target, keypath) != 0)
+			return 1;
+		if (pinned_fingerprint(target, fp, sizeof(fp)) == 0) {
+			if (have_reg && strcmp(e.fp, "-") != 0 &&
+			    strcmp(e.fp, fp) != 0) {
+				printf("%s: HOST KEY CHANGED for %s\n"
+				       "  pinned:   %s\n  observed: %s\n"
+				       "Refusing. Run 'remote rm %s' to reset "
+				       "if this is expected.\n", progname,
+				       target, e.fp, fp, name);
+				return 1;
+			}
+			if (!quiet)
+				printf("%s: host key %s\n", progname, fp);
+		}
+		if (registry_put(name, target, *fp ? fp : "-", keypath) != 0)
+			printf("%s: warning: could not record registry entry\n",
+			       progname);
+		if (!quiet)
+			printf("%s: host '%s' bootstrapped\n", progname, target);
+	}
+
+	/* Attaching needs a terminal, exactly like a local session. When there
+	 ** is none, a -H bootstrap still succeeded (return 0); a bare-name
+	 ** connect has nothing to show (return 1). */
+	save_term();
+	if (!quiet)
+		printf("%s: connecting to '%s' on %s\n", progname, name, target);
+	if (require_tty())
+		return bootstrap ? 0 : 1;
+
+	/* Forced command runs `atch --relay`; it reads SSH_ORIGINAL_COMMAND
+	 ** (the name we send) and execs `atch <name>` on the remote. */
+	return run_ssh(target, keypath, 2, NULL, name) == 0 ? 0 : 1;
+}
+
+/*
+** Forced-command relay (remote side). Invoked as `atch --relay` from the
+** restricted authorized_keys line; re-dispatches SSH_ORIGINAL_COMMAND as local
+** atch arguments. Refuses to re-enter the relay or hop to another host.
+*/
+static int relay_main(void)
+{
+	const char *orig = getenv("SSH_ORIGINAL_COMMAND");
+	char buf[1024], self[512], *argv2[64], *tok, *save;
+	int n = 0;
+	ssize_t sl;
+
+	if (!orig || !*orig)
+		orig = "list";
+	snprintf(buf, sizeof(buf), "%s", orig);
+
+	sl = readlink("/proc/self/exe", self, sizeof(self) - 1);
+	if (sl > 0)
+		self[sl] = '\0';
+	else
+		snprintf(self, sizeof(self), "%s", progname);
+
+	argv2[n++] = self;
+	for (tok = strtok_r(buf, " \t", &save); tok && n < 62;
+	     tok = strtok_r(NULL, " \t", &save)) {
+		if (!strcmp(tok, "--relay") || !strcmp(tok, "-H")) {
+			printf("atch: relay refuses '%s'\n", tok);
+			return 1;
+		}
+		argv2[n++] = tok;
+	}
+	argv2[n] = NULL;
+	/* The relay runs the session on THIS host; mark the child so its
+	 ** bare-name path stays local and never re-resolves through the registry
+	 ** (which could point back and loop). */
+	setenv("ATCH_RELAY", "1", 1);
+	execv(self, argv2);
+	return 127;
 }
 
 /*
@@ -1252,6 +1614,7 @@ static void usage(void)
 	       "  current\t\t\t\tPrint current session name\n"
 	       "\n"
 	       "Options:\n"
+	       "  -H <host>\tBootstrap+attach a session on a remote host over ssh\n"
 	       "  -e <char>\tSet detach character (default: ^\\)\n"
 	       "  -E\t\tDisable detach character\n"
 	       "  -r <method>\tRedraw method: none | ctrl_l | winch\n"
@@ -1277,6 +1640,10 @@ int main(int argc, char **argv)
 	if (argc < 1)
 		usage();
 
+	/* Forced-command relay (remote side): re-dispatch SSH_ORIGINAL_COMMAND. */
+	if (strcmp(*argv, "--relay") == 0)
+		return relay_main();
+
 	/* --help / --version / -h */
 	if (strcmp(*argv, "--help") == 0 || strcmp(*argv, "-h") == 0 ||
 	    strcmp(*argv, "?") == 0)
@@ -1299,13 +1666,17 @@ int main(int argc, char **argv)
 		char c = argv[0][1];
 
 		if (c != 'e' && c != 'E' && c != 'r' && c != 'R' &&
-		    c != 'z' && c != 'q' && c != 't' && c != 'C')
+		    c != 'z' && c != 'q' && c != 't' && c != 'C' && c != 'H')
 			break;
 		if (parse_options(&argc, &argv))
 			return 1;
 	}
 	if (argc < 1)
 		usage();
+
+	/* -H HOST <name>: bootstrap (if needed) and attach a remote session. */
+	if (remote_host)
+		return remote_main(remote_host, argv[0]);
 
 	/*
 	 ** Legacy backward-compat: flag-based syntax (-a, -c, -n, -N, etc.).

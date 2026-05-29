@@ -82,6 +82,15 @@ test: build-docker
 		--platform linux/$(arch) $(IMAGE):$(arch) \
 		sh /src/tests/test.sh /src/build/atch
 
+# Remote-bootstrap integration test: spins up sshd on localhost inside the
+# container and drives `atch -H` end to end. Needs to start a daemon, so it
+# runs the container as root (the default) and installs openssh on the fly.
+.PHONY: test-ssh
+test-ssh: build-docker
+	docker run --rm -v "$$PWD":/src \
+		--platform linux/$(arch) $(IMAGE):$(arch) \
+		sh /src/tests/ssh-test.sh /src/build/atch
+
 .PHONY: release
 release: man $(archs)
 
