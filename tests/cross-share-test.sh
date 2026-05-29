@@ -49,6 +49,19 @@ has "shared to 3 target" "$SH" "share: three targets armed"
 i=0; while [ $i -lt 20 ] && [ ! -S "$GS" ]; do sleep 0.1; i=$((i+1)); done
 if [ -S "$GS" ]; then ok "share: guest listener present"; else fail "share: guest listener present"; fi
 
+# ── staged guest binary: a guest with no atch can exec it by absolute path ────
+# Owner is root here, so it lands at /run/atch/atch (the /run path); a non-root
+# owner would get /tmp/.atch-bin.<uid>.
+STAGED=/run/atch/atch
+if [ -x "$STAGED" ]; then ok "stage: guest binary present at $STAGED"; else fail "stage: guest binary present" "$STAGED missing"; fi
+has "$STAGED join demo" "$SH" "stage: share output prints the binless-guest command"
+# a different, unprivileged user can actually execute the staged copy
+if su bob -c "$STAGED --version" >/dev/null 2>&1; then
+    ok "stage: ungranted-but-binless user can exec the staged copy"
+else
+    fail "stage: ungranted user can exec the staged copy"
+fi
+
 # ── 1. SO_PEERCRED accept/reject (observed via the master's audit log) ────────
 poke alice;  poke carol;  poke dave;  poke bob
 sleep 0.3

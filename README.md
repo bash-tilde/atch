@@ -452,6 +452,24 @@ Multiple guests can join at once, and they see the full replayed history just
 like the owner. Read-only guests have their keystrokes silently discarded —
 they cannot inject input or signal the program no matter what they send.
 
+**Guests don't need `atch` installed.** This matters most for a session you are
+running on a *remote* host (`atch remote …`): the bootstrapped binary lives in
+the session owner's `~/.cache/atch/`, which another user's account cannot read.
+So when you share, `atch` also drops a world-readable copy of itself that any
+local user can exec by absolute path, and `share` prints the exact command:
+
+```
+atch: session 'work' shared to 1 target(s), expires in 30m 0s
+  guest socket: /tmp/.atch-guest.1000.work
+  others can run: atch join work
+  (no atch on their box? /tmp/.atch-bin.1000 join work)
+```
+
+A root-owned session stages it at `/run/<prog>/<prog>` (e.g. `/run/atch/atch`);
+a non-root session uses `/tmp/.<prog>-bin.<uid>`, because creating a directory
+under `/run` needs privilege and `atch` stays unprivileged. So the guest simply
+runs the printed command, e.g. `/run/atch/atch join work`.
+
 **Authorization is by identity, not by file permissions.** When you share a
 session, `atch` spins up a second *guest listener* socket in a world-traversable
 directory so other users can reach it; that socket is deliberately left

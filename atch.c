@@ -47,6 +47,62 @@ void guest_socket_path(char *buf, size_t size, unsigned uid, const char *name)
 	snprintf(buf, size, "/tmp/.%s-guest.%u.%s", base, uid, name);
 }
 
+/*
+** Path where `share` stages a world-readable copy of the binary so a guest who
+** has no atch of their own can exec it by absolute path. The bootstrapped
+** binary lives in the owner's `~/.cache/<prog>/` which other users cannot
+** traverse, hence a separate world-readable copy. A root-owned session can use
+** /run (tmpfs, reboot-clean); everyone else falls back to /tmp, since creating
+** /run/<prog> needs privilege.
+*/
+void guest_bin_path(char *buf, size_t size, unsigned uid)
+{
+	const char *base = strrchr(progname, '/');
+
+	base = base ? base + 1 : progname;
+	if (geteuid() == 0)
+		snprintf(buf, size, "/run/%s/%s", base, base);
+	else
+		snprintf(buf, size, "/tmp/.%s-bin.%u", base, uid);
+}
+
+/*
+** Copy our own binary to `dest` (mode 0755) for guest_bin_path staging.
+** Atomic via a temp file + rename so a guest never execs a partial copy.
+** Returns 0 on success, -1 otherwise (caller treats failure as non-fatal).
+*/
+static int stage_self_to(const char *dest)
+{
+	char tmp[600], buf[65536];
+	int in, out;
+	ssize_t n;
+
+	in = open("/proc/self/exe", O_RDONLY);
+	if (in < 0)
+		return -1;
+	snprintf(tmp, sizeof(tmp), "%s.tmp.%u", dest, (unsigned)getpid());
+	out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+	if (out < 0) {
+		close(in);
+		return -1;
+	}
+	while ((n = read(in, buf, sizeof(buf))) > 0)
+		if (write(out, buf, (size_t)n) != n) {
+			close(in);
+			close(out);
+			unlink(tmp);
+			return -1;
+		}
+	close(in);
+	close(out);
+	if (n < 0 || rename(tmp, dest) != 0) {
+		unlink(tmp);
+		return -1;
+	}
+	chmod(dest, 0755);
+	return 0;
+}
+
 /* Returns the directory where session sockets are stored. */
 void get_session_dir(char *buf, size_t size)
 {
@@ -1361,9 +1417,10 @@ static int cmd_share(int argc, char **argv)
 	char *spec = NULL, *name = NULL;
 	long minutes = 60;
 	int write_default = 0, i, ntargets = 0;
-	char sharepath[600], gp[256], *buf, *save, *tok;
+	char sharepath[600], gp[256], gb[300], *buf, *save, *tok;
 	struct stat st;
 	time_t expiry;
+	int staged = 0;
 	FILE *f;
 
 	for (i = 0; i < argc; i++) {
@@ -1465,6 +1522,20 @@ static int cmd_share(int argc, char **argv)
 		return 1;
 	}
 
+	/* Stage a world-readable copy of ourselves so a guest who doesn't have
+	 ** atch installed can still join by absolute path. Best-effort: if it
+	 ** fails, guests that already have atch are unaffected. */
+	guest_bin_path(gb, sizeof(gb), (unsigned)getuid());
+	if (geteuid() == 0) {
+		const char *base = strrchr(progname, '/');
+		char dir[280];
+
+		base = base ? base + 1 : progname;
+		snprintf(dir, sizeof(dir), "/run/%s", base);
+		mkdir(dir, 0755);
+	}
+	staged = (stage_self_to(gb) == 0);
+
 	if (!quiet) {
 		guest_socket_path(gp, sizeof(gp), (unsigned)getuid(),
 				  session_shortname());
@@ -1478,6 +1549,11 @@ static int cmd_share(int argc, char **argv)
 		}
 		printf("\n  guest socket: %s\n  others can run: %s join %s\n",
 		       gp, progname, session_shortname());
+		if (staged)
+			printf("  (no %s on their box? %s join %s)\n",
+			       strrchr(progname, '/') ? strrchr(progname,
+								'/') + 1 :
+			       progname, gb, session_shortname());
 	}
 	return 0;
 

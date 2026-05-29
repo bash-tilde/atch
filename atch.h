@@ -148,6 +148,10 @@ int push_main(void);
 /* Sharing. The guest listener lives in a world-traversable dir so other users
 ** can reach it; SO_PEERCRED in the master is the real ACL. */
 void guest_socket_path(char *buf, size_t size, unsigned uid, const char *name);
+/* Path where `share` stages a world-readable copy of the binary, so a guest
+** with no atch of their own can join by absolute path (/run/<prog> when root,
+** else /tmp). */
+void guest_bin_path(char *buf, size_t size, unsigned uid);
 int notify_master(int msgtype);   /* connect to sockname, send a control packet */
 int rm_main(int all);
 int list_main(int show_all);
