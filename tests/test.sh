@@ -971,10 +971,16 @@ run "$ATCH" remote rm
 assert_exit     "remote rm: no name → exit 1"        1 "$rc"
 assert_contains "remote rm: no name → usage"         "usage" "$out"
 
-# remote: unknown subcommand
+# remote: a lone argument is neither a subcommand nor a <host> <session> pair
 run "$ATCH" remote frobnicate
-assert_exit     "remote: bad subcmd → exit 1"        1 "$rc"
-assert_contains "remote: bad subcmd → message"       "unknown subcommand" "$out"
+assert_exit     "remote: lone arg → exit 1"          1 "$rc"
+assert_contains "remote: lone arg → usage"           "usage" "$out"
+
+# remote <host> <session>: the bootstrap form is recognized (fails here only
+# because the Alpine build image has no ssh/ssh-keygen, not because of parsing)
+run "$ATCH" remote 192.0.2.1 somesession
+assert_exit     "remote <host> <session>: recognized (exit 1, no ssh here)" 1 "$rc"
+assert_not_contains "remote <host> <session>: not a usage error" "usage" "$out"
 
 rm -f "$REG"
 

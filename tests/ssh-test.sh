@@ -47,9 +47,9 @@ chmod 600 /root/.ssh/authorized_keys
 # Make sure our config dir starts clean.
 rm -rf /root/.config/atch /root/.cache/atch
 
-# ── 1. bootstrap via -H (interactive attach can't complete headless) ──────────
+# --- 1. bootstrap via `remote <host> <session>` (attach cannot complete headless) ---
 # The final attach needs a tty; we only care that bootstrap's side effects land.
-timeout 20 "$ATCH" -H localhost demo </dev/null >/tmp/boot.out 2>&1 || true
+timeout 20 "$ATCH" remote localhost demo </dev/null >/tmp/boot.out 2>&1 || true
 BOOT=$(cat /tmp/boot.out)
 
 have "bootstrapping localhost" "$BOOT" "bootstrap: announces bootstrap"
@@ -88,7 +88,7 @@ have "demo localhost SHA256:" "$REG" "bootstrap: registry entry with fingerprint
 have "id_ed25519" "$REG" "bootstrap: registry records identity key path"
 
 # ── 2. idempotent re-bootstrap doesn't duplicate the authorized_keys line ─────
-timeout 20 "$ATCH" -H localhost demo </dev/null >/dev/null 2>&1 || true
+timeout 20 "$ATCH" remote localhost demo </dev/null >/dev/null 2>&1 || true
 NLINES=$(grep -c -- "--relay" /root/.ssh/authorized_keys)
 if [ "$NLINES" = "1" ]; then
     ok "re-bootstrap: authorized_keys line not duplicated"
@@ -116,7 +116,7 @@ have "refuses" "$RR" "relay: refuses nested --relay"
 # Tamper the pinned fingerprint in the registry; bootstrap must refuse.
 sed -i 's#demo localhost SHA256:[^ ]*#demo localhost SHA256:AAAAtampered#' \
     /root/.config/atch/registry
-CHG=$(timeout 20 "$ATCH" -H localhost demo </dev/null 2>&1 || true)
+CHG=$(timeout 20 "$ATCH" remote localhost demo </dev/null 2>&1 || true)
 have "HOST KEY CHANGED" "$CHG" "pinning: refuses a changed host key"
 
 # ── 5. bare-name resolves to the remote via the registry ──────────────────────

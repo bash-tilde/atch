@@ -52,7 +52,7 @@ output is gone. With `atch` it is on disk until you clear it.
 - List sessions with liveness status; `list -a` also shows exited sessions that still have a log on disk
 - **One-command cleanup** — `rm <session>` or `rm -a` removes stale/exited sessions and their logs
 - **Share a session with other users** — read-only by default; grant input per-user or per-group, time-boxed and revocable. Access is decided by kernel-verified peer identity (`SO_PEERCRED`), not file permissions
-- **Remote sessions with nothing to preinstall** — `atch -H host name` self-deploys the static binary over your own ssh, then re-attaches by bare name. No credentials are stored
+- **Remote sessions with nothing to preinstall** — `atch remote host name` self-deploys the static binary over your own ssh, then re-attaches by bare name. No credentials are stored
 - Prevents accidental recursive self-attach
 - Tiny and auditable
 
@@ -101,7 +101,7 @@ make
 
 ```
 atch [<session> [command...]]   Attach to session or create it (default)
-atch -H <host> <session>        Attach to a session on a remote host (bootstrapping it)
+atch remote <host> <session>    Attach to a session on a remote host (bootstrapping it)
 atch <command> [options] ...
 ```
 
@@ -130,7 +130,8 @@ If no command is given, `$SHELL` is used.
 | `share <session> --to <spec> [-m MIN] [--write]` | Share a running session with other local users, **read-only by default**. `<spec>` is a comma-separated list of `user` or `@group` targets, each with an optional `:rw` / `:ro` suffix; `--write` makes every target writable by default. `-m` auto-revokes after `MIN` minutes (`0` = never; default 60). See [Sharing a session](#sharing-a-session). |
 | `join <session>` | Attach to a session another user has shared with you. |
 | `unshare <session>` | Revoke a share immediately. Expiry revokes it automatically as well. |
-| `remote <add\|ls\|rm> ...` | Manage the remote-session registry: `add <name> <host>` maps a name to a host, `ls` lists the mappings, `rm <name>` forgets one. See [Remote sessions](#remote-sessions). |
+| `remote <host> <session>` | Bootstrap (on first use) and attach to a session on a remote host over ssh. `<host>` may be a hostname, FQDN, IP address, or `user@host`. See [Remote sessions](#remote-sessions). |
+| `remote <add\|ls\|rm> ...` | Manage the remote-session registry: `add <name> <host>` maps a name to a host, `ls` lists the mappings, `rm <name>` forgets one. |
 | `current` | Print the current session name and exit 0 if inside a session; exit 1 silently if not. |
 
 Short aliases: `a` → `attach`, `n` → `new`, `s` → `start`, `p` → `push`,
@@ -142,7 +143,6 @@ Options can appear before the subcommand, before the session name, or after the 
 
 | Flag | Description |
 |------|-------------|
-| `-H <host>` | Attach to the session on a remote `<host>` over ssh, bootstrapping the host on first use (see [Remote sessions](#remote-sessions)). `<host>` may be `host` or `user@host`. |
 | `-e <char>` | Set the detach character. Accepts `^X` notation. Default: `^\`. |
 | `-E` | Disable the detach character entirely. |
 | `-r <method>` | Redraw method on attach: `none`, `ctrl_l`, or `winch` (default). |
@@ -263,10 +263,11 @@ atch unshare work
 
 **Open a session on a remote host that has never seen `atch`:**
 ```sh
-atch -H 10.0.0.7 logs
+atch remote 10.0.0.7 logs
+atch remote ansible.example.net logs    # hostname / FQDN works too
 ```
 
-**Re-attach to it later by bare name (no `-H` needed):**
+**Re-attach to it later by bare name (no host needed):**
 ```sh
 atch logs
 ```
@@ -473,7 +474,9 @@ runs entirely as you.
 preinstalled** — not even `atch` itself:
 
 ```sh
-atch -H 10.0.0.7 logs
+atch remote 10.0.0.7 logs              # IP address
+atch remote ansible.example.net logs   # hostname or FQDN
+atch remote deploy@10.0.0.7 logs       # or user@host
 ```
 
 On first contact `atch` bootstraps the host over your *own* ssh — whatever
@@ -491,7 +494,7 @@ own.** Over that one connection it:
   `~/.config/atch/known_hosts`, and refuses to continue if it ever changes;
 - records the `name → host` mapping in `~/.config/atch/registry`.
 
-After that, the bare name is enough — no `-H`, no re-bootstrapping, and no
+After that, the bare name is enough — no host, no re-bootstrapping, and no
 interactive auth, because the dedicated key takes over:
 
 ```sh

@@ -281,8 +281,6 @@ int clear_method = CLEAR_UNSPEC;
 int quiet = 0;
 /* 1 if we should not send ansi sequences to the terminal */
 int no_ansiterm = 0;
-/* Remote host from -H HOST, or NULL for a local session. */
-char *remote_host = NULL;
 
 /*
 ** The original terminal settings. Shared between the master and attach
@@ -335,19 +333,7 @@ static int parse_options(int *argc, char ***argv)
 		for (p = (*argv)[0] + 1; *p; ++p) {
 			if (*p == 'E')
 				detach_char = -1;
-			else if (*p == 'H') {
-				++(*argv);
-				--(*argc);
-				if (*argc < 1) {
-					printf("%s: No remote host "
-					       "specified.\n", progname);
-					printf("Try '%s --help' for more "
-					       "information.\n", progname);
-					return 1;
-				}
-				remote_host = (*argv)[0];
-				break;
-			} else if (*p == 'z')
+			else if (*p == 'z')
 				no_suspend = 1;
 			else if (*p == 'q')
 				quiet = 1;
@@ -895,7 +881,7 @@ static int cmd_open(char *session, int argc, char **argv)
 
 	/* Bare name that resolves in the registry → remote session. Skipped
 	 ** under the relay, which must run the session on the local host. */
-	if (!remote_host && !getenv("ATCH_RELAY") && registry_lookup(session, &e))
+	if (!getenv("ATCH_RELAY") && registry_lookup(session, &e))
 		return remote_main(NULL, session);
 
 	sockname = session;
@@ -925,10 +911,14 @@ static int cmd_open(char *session, int argc, char **argv)
 }
 
 /*
+** atch remote <host> <session>    — bootstrap (if needed) and attach a session
+**                                   on a remote host (host may be an FQDN, IP,
+**                                   or user@host)
 ** atch remote add <name> <host>   — record/replace a name -> host mapping
 ** atch remote ls                  — list registered remote sessions
 ** atch remote rm <name>           — forget a mapping
-** The registry holds no secrets; -H bootstrap (item 5) also writes here.
+** The registry holds no secrets; a `remote <host> <session>` bootstrap writes
+** the host/fingerprint/key path here too.
 */
 static int cmd_remote(int argc, char **argv)
 {
@@ -937,7 +927,8 @@ static int cmd_remote(int argc, char **argv)
 	int n;
 
 	if (argc < 1) {
-		printf("usage: %s remote <add|ls|rm> ...\n", progname);
+		printf("usage: %s remote <host> <session>\n"
+		       "       %s remote <add|ls|rm> ...\n", progname, progname);
 		return 1;
 	}
 
@@ -1010,7 +1001,12 @@ static int cmd_remote(int argc, char **argv)
 		return 0;
 	}
 
-	printf("%s: remote: unknown subcommand '%s'\n", progname, argv[0]);
+	/* Otherwise: `remote <host> <session>` — bootstrap and attach. */
+	if (argc == 2)
+		return remote_main(argv[0], argv[1]);
+
+	printf("usage: %s remote <host> <session>\n"
+	       "       %s remote <add|ls|rm> ...\n", progname, progname);
 	return 1;
 }
 
@@ -1247,22 +1243,24 @@ static int pinned_fingerprint(const char *host, char *fp, size_t size)
 }
 
 /*
-** Drive a remote session. With -H (remote_host set) this (re)bootstraps the
-** host, then attaches; a bare name that resolved in the registry skips
-** straight to attach using the stored host/key/fingerprint. Host-key change
-** between a stored pin and what we now observe is refused (item 6).
+** Drive a remote session. When an explicit host is given (`remote <host>
+** <session>`) this (re)bootstraps it, then attaches; a bare name that resolved
+** in the registry passes host=NULL and skips straight to attach using the
+** stored host/key/fingerprint. A host-key change between a stored pin and what
+** we now observe is refused (item 6).
 */
 static int remote_main(const char *host, const char *name)
 {
 	char keypath[600], fp[256] = "";
 	struct regentry e;
-	int have_reg, bootstrap = (remote_host != NULL);
+	int have_reg, bootstrap = (host != NULL);
 	const char *target;
 
 	have_reg = registry_lookup(name, &e);
 	target = host ? host : (have_reg ? e.host : NULL);
 	if (!target) {
-		printf("%s: no remote host known for '%s' (use -H HOST)\n",
+		printf("%s: no remote host known for '%s' "
+		       "(use: %s remote <host> %s)\n", progname, name,
 		       progname, name);
 		return 1;
 	}
@@ -1299,7 +1297,7 @@ static int remote_main(const char *host, const char *name)
 	}
 
 	/* Attaching needs a terminal, exactly like a local session. When there
-	 ** is none, a -H bootstrap still succeeded (return 0); a bare-name
+	 ** is none, an explicit bootstrap still succeeded (return 0); a bare-name
 	 ** connect has nothing to show (return 1). */
 	save_term();
 	if (!quiet)
@@ -1337,7 +1335,7 @@ static int relay_main(void)
 	argv2[n++] = self;
 	for (tok = strtok_r(buf, " \t", &save); tok && n < 62;
 	     tok = strtok_r(NULL, " \t", &save)) {
-		if (!strcmp(tok, "--relay") || !strcmp(tok, "-H")) {
+		if (!strcmp(tok, "--relay") || !strcmp(tok, "remote")) {
 			printf("atch: relay refuses '%s'\n", tok);
 			return 1;
 		}
@@ -1607,14 +1605,14 @@ static void usage(void)
 	       "    --write\t\t\tGrant input to all targets by default\n"
 	       "  join    <session>\t\t\tAttach to a session shared with you\n"
 	       "  unshare <session>\t\t\tRevoke a share early\n"
-	       "  remote  <add|ls|rm> ...\t\tManage remote session registry\n"
+	       "  remote  <host> <session>\t\tBootstrap+attach a session on a remote host\n"
+	       "  remote  <add|ls|rm> ...\t\tManage the remote session registry\n"
 	       "    add <name> <host>\t\tMap a session name to a remote host\n"
 	       "    ls\t\t\t\tList registered remote sessions\n"
 	       "    rm <name>\t\t\tForget a mapping\n"
 	       "  current\t\t\t\tPrint current session name\n"
 	       "\n"
 	       "Options:\n"
-	       "  -H <host>\tBootstrap+attach a session on a remote host over ssh\n"
 	       "  -e <char>\tSet detach character (default: ^\\)\n"
 	       "  -E\t\tDisable detach character\n"
 	       "  -r <method>\tRedraw method: none | ctrl_l | winch\n"
@@ -1666,17 +1664,13 @@ int main(int argc, char **argv)
 		char c = argv[0][1];
 
 		if (c != 'e' && c != 'E' && c != 'r' && c != 'R' &&
-		    c != 'z' && c != 'q' && c != 't' && c != 'C' && c != 'H')
+		    c != 'z' && c != 'q' && c != 't' && c != 'C')
 			break;
 		if (parse_options(&argc, &argv))
 			return 1;
 	}
 	if (argc < 1)
 		usage();
-
-	/* -H HOST <name>: bootstrap (if needed) and attach a remote session. */
-	if (remote_host)
-		return remote_main(remote_host, argv[0]);
 
 	/*
 	 ** Legacy backward-compat: flag-based syntax (-a, -c, -n, -N, etc.).
