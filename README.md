@@ -51,6 +51,8 @@ output is gone. With `atch` it is on disk until you clear it.
 - Push stdin directly to a running session
 - List sessions with liveness status; `list -a` also shows exited sessions that still have a log on disk
 - **One-command cleanup** — `rm <session>` or `rm -a` removes stale/exited sessions and their logs
+- **Share a session with other users** — read-only by default; grant input per-user or per-group, time-boxed and revocable. Access is decided by kernel-verified peer identity (`SO_PEERCRED`), not file permissions
+- **Remote sessions with nothing to preinstall** — `atch -H host name` self-deploys the static binary over your own ssh, then re-attaches by bare name. No credentials are stored
 - Prevents accidental recursive self-attach
 - Tiny and auditable
 
@@ -99,11 +101,14 @@ make
 
 ```
 atch [<session> [command...]]   Attach to session or create it (default)
+atch -H <host> <session>        Attach to a session on a remote host (bootstrapping it)
 atch <command> [options] ...
 ```
 
 Sessions are identified by name. A bare name (no `/`) is stored as a socket
 under `~/.cache/atch/`. A name containing `/` is used as-is as a filesystem path.
+A bare name that has been registered against a remote host (see
+[Remote sessions](#remote-sessions)) resolves to that host instead.
 
 If no command is given, `$SHELL` is used.
 
@@ -122,10 +127,14 @@ If no command is given, `$SHELL` is used.
 | `tail [-f] [-n N] <session>` | Print the last N lines of the session log (default: 10). Works for both running and exited sessions. With `-f`, follow new output as it is written (useful for monitoring a running session without attaching). |
 | `list [-a]` | List sessions. Shows `[attached]` when a client is connected, `[stale]` for leftover sockets with no running master. With `-a`, also shows `[exited]` sessions that have a log file but are no longer running. Prints `(no sessions)` when the list is empty. |
 | `rm [-a] [<session>]` | Remove a session and its log. Refuses if the session is currently running — use `kill` first. Works on stale (socket exists but process is dead) and exited (log only) sessions. With `-a`, sweeps all stale and exited sessions at once. |
+| `share <session> --to <spec> [-m MIN] [--write]` | Share a running session with other local users, **read-only by default**. `<spec>` is a comma-separated list of `user` or `@group` targets, each with an optional `:rw` / `:ro` suffix; `--write` makes every target writable by default. `-m` auto-revokes after `MIN` minutes (`0` = never; default 60). See [Sharing a session](#sharing-a-session). |
+| `join <session>` | Attach to a session another user has shared with you. |
+| `unshare <session>` | Revoke a share immediately. Expiry revokes it automatically as well. |
+| `remote <add\|ls\|rm> ...` | Manage the remote-session registry: `add <name> <host>` maps a name to a host, `ls` lists the mappings, `rm <name>` forgets one. See [Remote sessions](#remote-sessions). |
 | `current` | Print the current session name and exit 0 if inside a session; exit 1 silently if not. |
 
 Short aliases: `a` → `attach`, `n` → `new`, `s` → `start`, `p` → `push`,
-`k` → `kill`, `l` / `ls` → `list`.
+`k` → `kill`, `l` / `ls` → `list`, `j` → `join`.
 
 ## Options
 
@@ -133,6 +142,7 @@ Options can appear before the subcommand, before the session name, or after the 
 
 | Flag | Description |
 |------|-------------|
+| `-H <host>` | Attach to the session on a remote `<host>` over ssh, bootstrapping the host on first use (see [Remote sessions](#remote-sessions)). `<host>` may be `host` or `user@host`. |
 | `-e <char>` | Set the detach character. Accepts `^X` notation. Default: `^\`. |
 | `-E` | Disable the detach character entirely. |
 | `-r <method>` | Redraw method on attach: `none`, `ctrl_l`, or `winch` (default). |
@@ -232,6 +242,33 @@ atch rm crashed-job
 **Sweep all stale and exited sessions in one go:**
 ```sh
 atch rm -a
+```
+
+**Share a session read-only with a coworker for 30 minutes:**
+```sh
+atch share work --to alice -m 30
+# alice, on the same machine:
+atch join work
+```
+
+**Share with a whole group, and let one person type:**
+```sh
+atch share deploy --to @ops,alice:rw
+```
+
+**Revoke a share early:**
+```sh
+atch unshare work
+```
+
+**Open a session on a remote host that has never seen `atch`:**
+```sh
+atch -H 10.0.0.7 logs
+```
+
+**Re-attach to it later by bare name (no `-H` needed):**
+```sh
+atch logs
 ```
 
 ## Session storage
@@ -382,6 +419,96 @@ clear() { command clear; [ -n "$ATCH_SESSION" ] && atch clear 2>/dev/null; }
 
 This only fires for the literal `clear` command, not for full-screen programs
 like `vim` or `htop` that also erase the terminal.
+
+## Sharing a session
+
+By default a session is yours alone: its socket is `chmod 0600` in your own
+`~/.cache/atch/`, so the filesystem already keeps everyone else out. `atch
+share` opens a running session to specific other users on the same machine —
+**read-only by default**, so the common case of "let someone watch what I'm
+doing" carries no risk of them touching the keyboard.
+
+```sh
+atch share work --to alice            # alice can watch, not type
+atch share work --to alice:rw         # alice can type too
+atch share work --to @ops             # everyone in group "ops", read-only
+atch share work --to alice:rw,@ops    # mix per-target modes freely
+atch share work --to @ops --write     # writable by default for every target
+```
+
+A share is **time-boxed**. It auto-revokes after 60 minutes by default; pass
+`-m <minutes>` to change it, or `-m 0` for no expiry. `atch unshare work`
+revokes it immediately. Either way the guest listener is closed, its socket
+removed, and any connected guests are dropped on the spot.
+
+A coworker the session is shared with attaches with `atch join`:
+
+```sh
+atch join work
+```
+
+Multiple guests can join at once, and they see the full replayed history just
+like the owner. Read-only guests have their keystrokes silently discarded —
+they cannot inject input or signal the program no matter what they send.
+
+**Authorization is by identity, not by file permissions.** When you share a
+session, `atch` spins up a second *guest listener* socket in a world-traversable
+directory so other users can reach it; that socket is deliberately left
+wide-open at the filesystem level. The real gate is in the master: on every
+connection it reads the peer's user and group identity straight from the kernel
+(`SO_PEERCRED`) — an identity the connecting process cannot forge — and checks
+it against the targets you granted, including the peer's supplementary groups.
+Anyone not on the list is refused before they see a single byte. The grant, and
+every join and rejection, is recorded in the session log. When the share ends
+the listener disappears, so there is never an open socket sitting around without
+an allow-list behind it.
+
+This needs no privileged setup — no `sudo`, no shared group you both have to
+belong to, no fiddling with socket ownership. `atch` never calls `setuid` and
+runs entirely as you.
+
+## Remote sessions
+
+`atch` can attach to a session on another machine that has **nothing
+preinstalled** — not even `atch` itself:
+
+```sh
+atch -H 10.0.0.7 logs
+```
+
+On first contact `atch` bootstraps the host over your *own* ssh — whatever
+already lets you `ssh 10.0.0.7` (an agent key, an entry in `~/.ssh/config`, or a
+password prompt) is exactly what it uses. **`atch` stores no credentials of its
+own.** Over that one connection it:
+
+- generates a dedicated ed25519 key (`~/.config/atch/id_ed25519`) the first time
+  it is ever needed, and installs it into the remote `~/.ssh/authorized_keys`
+  behind a restricted, forced-command line so the key can do nothing but invoke
+  the relay;
+- copies the self-contained static binary into the remote `~/.cache/atch/`, so
+  the host needs no package, no compiler, and nothing in its `PATH`;
+- pins the host's key on first sight (trust-on-first-use) in a private
+  `~/.config/atch/known_hosts`, and refuses to continue if it ever changes;
+- records the `name → host` mapping in `~/.config/atch/registry`.
+
+After that, the bare name is enough — no `-H`, no re-bootstrapping, and no
+interactive auth, because the dedicated key takes over:
+
+```sh
+atch logs            # re-attaches to 'logs' on 10.0.0.7
+```
+
+The registry holds no secrets, only the host, its pinned fingerprint, and the
+path to the identity key. Manage it directly with `atch remote`:
+
+```sh
+atch remote ls                   # list registered remote sessions
+atch remote add logs 10.0.0.7    # record a name → host mapping by hand
+atch remote rm logs              # forget a mapping
+```
+
+Using a dedicated key rather than your personal identity, locked to a forced
+command, keeps the blast radius to "can run atch on this host" if it ever leaks.
 
 ## Backward compatibility
 
