@@ -70,6 +70,174 @@ void get_session_dir(char *buf, size_t size)
 		snprintf(buf, size, "/tmp/.%s-%d", base, (int)getuid());
 }
 
+/* ───────── Remote session registry (spec item 4) ──────────────────────────
+** Maps a bare session name to a remote host so `atch <name>` can reattach
+** without re-specifying the host. Flat-line file at ~/.config/<prog>/registry:
+**
+**   <name> <host> <hostkey-fp-or-"-"> <identity-key-path-or-"-">
+**
+** Whitespace-separated, one entry per line; a leading '#' is a comment. The
+** registry holds NO secrets: first contact uses the user's own ssh (agent /
+** config), and a dedicated key thereafter; the fingerprint column is for
+** host-key pinning (item 6), the key column names the identity to present.
+*/
+#define REG_MAXLINE 1024
+
+struct regentry {
+	char name[128];
+	char host[256];
+	char fp[256];		/* pinned host-key fingerprint, or "-" */
+	char key[512];		/* identity (private key) path, or "-" */
+};
+
+/* Directory for atch config (registry, dedicated key): ~/.config/<prog>. */
+void get_config_dir(char *buf, size_t size)
+{
+	const char *home = getenv("HOME");
+	const char *base = strrchr(progname, '/');
+	struct passwd *pw;
+
+	base = base ? base + 1 : progname;
+	if (!home || !*home) {
+		pw = getpwuid(getuid());
+		if (pw && pw->pw_dir && *pw->pw_dir)
+			home = pw->pw_dir;
+	}
+	if (home && *home && strcmp(home, "/") != 0)
+		snprintf(buf, size, "%s/.config/%s", home, base);
+	else
+		snprintf(buf, size, "/tmp/.%s-cfg-%d", base, (int)getuid());
+}
+
+static void registry_path(char *buf, size_t size)
+{
+	char dir[512];
+
+	get_config_dir(dir, sizeof(dir));
+	snprintf(buf, size, "%s/registry", dir);
+}
+
+/* Create the config dir (and its parent) at 0700. Returns 0 on success. */
+static int ensure_config_dir(void)
+{
+	char dir[512], *slash;
+
+	get_config_dir(dir, sizeof(dir));
+	slash = strrchr(dir, '/');
+	if (slash) {
+		*slash = '\0';
+		mkdir(dir, 0700);
+		*slash = '/';
+	}
+	return (mkdir(dir, 0700) < 0 && errno != EEXIST) ? -1 : 0;
+}
+
+/* Find a registry entry by name. Returns 1 and fills *e if found, else 0. */
+static int registry_lookup(const char *name, struct regentry *e)
+{
+	char path[600], line[REG_MAXLINE];
+	FILE *f;
+	int found = 0;
+
+	registry_path(path, sizeof(path));
+	f = fopen(path, "r");
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof(line), f)) {
+		char n[128], h[256], fp[256], k[512];
+		int got;
+
+		if (line[0] == '#')
+			continue;
+		got = sscanf(line, "%127s %255s %255s %511s", n, h, fp, k);
+		if (got < 2 || strcmp(n, name) != 0)
+			continue;
+		memset(e, 0, sizeof(*e));
+		snprintf(e->name, sizeof(e->name), "%s", n);
+		snprintf(e->host, sizeof(e->host), "%s", h);
+		snprintf(e->fp, sizeof(e->fp), "%s", got >= 3 ? fp : "-");
+		snprintf(e->key, sizeof(e->key), "%s", got >= 4 ? k : "-");
+		found = 1;
+		break;
+	}
+	fclose(f);
+	return found;
+}
+
+/* Add or replace the entry for `name` (atomic rewrite via temp + rename).
+** Pass "-" or NULL for an unknown fingerprint/key. Returns 0 on success. */
+static int registry_put(const char *name, const char *host,
+			const char *fp, const char *key)
+{
+	char path[600], tmp[620], line[REG_MAXLINE];
+	FILE *in, *out;
+
+	if (ensure_config_dir() < 0)
+		return -1;
+	registry_path(path, sizeof(path));
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	out = fopen(tmp, "w");
+	if (!out)
+		return -1;
+	fchmod(fileno(out), 0600);
+
+	in = fopen(path, "r");
+	if (in) {
+		while (fgets(line, sizeof(line), in)) {
+			char n[128];
+
+			if (line[0] != '#' && sscanf(line, "%127s", n) == 1 &&
+			    strcmp(n, name) == 0)
+				continue;	/* drop the stale entry */
+			fputs(line, out);
+		}
+		fclose(in);
+	}
+	fprintf(out, "%s %s %s %s\n", name, host, fp && *fp ? fp : "-",
+		key && *key ? key : "-");
+	if (fclose(out) != 0 || rename(tmp, path) != 0) {
+		unlink(tmp);
+		return -1;
+	}
+	return 0;
+}
+
+/* Remove the entry for `name`. Returns 1 if removed, 0 if absent, -1 on error. */
+static int registry_remove(const char *name)
+{
+	char path[600], tmp[620], line[REG_MAXLINE];
+	FILE *in, *out;
+	int removed = 0;
+
+	registry_path(path, sizeof(path));
+	in = fopen(path, "r");
+	if (!in)
+		return 0;
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	out = fopen(tmp, "w");
+	if (!out) {
+		fclose(in);
+		return -1;
+	}
+	fchmod(fileno(out), 0600);
+	while (fgets(line, sizeof(line), in)) {
+		char n[128];
+
+		if (line[0] != '#' && sscanf(line, "%127s", n) == 1 &&
+		    strcmp(n, name) == 0) {
+			removed = 1;
+			continue;
+		}
+		fputs(line, out);
+	}
+	fclose(in);
+	if (fclose(out) != 0 || rename(tmp, path) != 0) {
+		unlink(tmp);
+		return -1;
+	}
+	return removed;
+}
+
 /*
 ** Long-path helper for Unix socket operations: saves cwd, chdirs into the
 ** directory part of path, calls fn(basename), then restores cwd.
@@ -733,6 +901,96 @@ static int cmd_open(char *session, int argc, char **argv)
 }
 
 /*
+** atch remote add <name> <host>   — record/replace a name -> host mapping
+** atch remote ls                  — list registered remote sessions
+** atch remote rm <name>           — forget a mapping
+** The registry holds no secrets; -H bootstrap (item 5) also writes here.
+*/
+static int cmd_remote(int argc, char **argv)
+{
+	char path[600], line[REG_MAXLINE];
+	FILE *f;
+	int n;
+
+	if (argc < 1) {
+		printf("usage: %s remote <add|ls|rm> ...\n", progname);
+		return 1;
+	}
+
+	if (!strcmp(argv[0], "add")) {
+		if (argc != 3) {
+			printf("usage: %s remote add <name> <host>\n", progname);
+			return 1;
+		}
+		if (registry_put(argv[1], argv[2], "-", "-") != 0) {
+			printf("%s: cannot write registry: %s\n", progname,
+			       strerror(errno));
+			return 1;
+		}
+		if (!quiet)
+			printf("%s: remote '%s' -> %s\n", progname, argv[1],
+			       argv[2]);
+		return 0;
+	}
+
+	if (!strcmp(argv[0], "ls") || !strcmp(argv[0], "list")) {
+		if (argc != 1) {
+			printf("usage: %s remote ls\n", progname);
+			return 1;
+		}
+		n = 0;
+		registry_path(path, sizeof(path));
+		f = fopen(path, "r");
+		if (f) {
+			while (fgets(line, sizeof(line), f)) {
+				char nm[128], h[256], fp[256];
+				int got;
+
+				if (line[0] == '#')
+					continue;
+				got = sscanf(line, "%127s %255s %255s", nm, h,
+					     fp);
+				if (got < 2)
+					continue;
+				printf("%-20s %s%s\n", nm, h,
+				       (got >= 3 && strcmp(fp, "-"))
+				       ? "  [host-key pinned]" : "");
+				n++;
+			}
+			fclose(f);
+		}
+		if (n == 0 && !quiet)
+			printf("%s: no remote sessions registered\n", progname);
+		return 0;
+	}
+
+	if (!strcmp(argv[0], "rm")) {
+		int r;
+
+		if (argc != 2) {
+			printf("usage: %s remote rm <name>\n", progname);
+			return 1;
+		}
+		r = registry_remove(argv[1]);
+		if (r < 0) {
+			printf("%s: cannot write registry: %s\n", progname,
+			       strerror(errno));
+			return 1;
+		}
+		if (r == 0) {
+			printf("%s: no such remote '%s'\n", progname, argv[1]);
+			return 1;
+		}
+		if (!quiet)
+			printf("%s: remote '%s' removed\n", progname, argv[1]);
+		return 0;
+	}
+
+	printf("%s: remote: unknown subcommand '%s'\n", progname, argv[0]);
+	return 1;
+}
+
+/*
 ** atch share <session> --to <spec> [-m MINUTES] [--write]
 ** Resolve the target users/groups to numeric ids, write a <session>.share
 ** descriptor next to the socket, and tell the running master to arm the guest
@@ -987,6 +1245,10 @@ static void usage(void)
 	       "    --write\t\t\tGrant input to all targets by default\n"
 	       "  join    <session>\t\t\tAttach to a session shared with you\n"
 	       "  unshare <session>\t\t\tRevoke a share early\n"
+	       "  remote  <add|ls|rm> ...\t\tManage remote session registry\n"
+	       "    add <name> <host>\t\tMap a session name to a remote host\n"
+	       "    ls\t\t\t\tList registered remote sessions\n"
+	       "    rm <name>\t\t\tForget a mapping\n"
 	       "  current\t\t\t\tPrint current session name\n"
 	       "\n"
 	       "Options:\n"
@@ -1180,6 +1442,8 @@ int main(int argc, char **argv)
 		return cmd_join(argc, argv);
 	if (is_cmd(cmd, "unshare", NULL, NULL))
 		return cmd_unshare(argc, argv);
+	if (is_cmd(cmd, "remote", NULL, NULL))
+		return cmd_remote(argc, argv);
 
 	/* Smart default: treat first arg as session name → attach-or-create */
 	return cmd_open((char *)cmd, argc, argv);

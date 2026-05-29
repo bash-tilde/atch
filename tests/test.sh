@@ -908,7 +908,77 @@ assert_contains "unshare: no args → usage"           "usage" "$out"
 tidy s-share
 rm -f "$HOME/.cache/atch/s-share.log" "$GUEST_SOCK"
 
-# ── 24. no-args → usage ──────────────────────────────────────────────────────
+# ── 24. remote registry (share-name -> host mapping) ─────────────────────────
+# The registry holds no secrets; -H bootstrap (item 5) reuses these helpers.
+
+REG="$HOME/.config/atch/registry"
+
+# remote: no subcommand → usage
+run "$ATCH" remote
+assert_exit     "remote: no subcmd → exit 1"         1 "$rc"
+assert_contains "remote: no subcmd → usage"          "usage" "$out"
+
+# remote ls: empty registry
+run "$ATCH" remote ls
+assert_exit     "remote ls: empty → exit 0"          0 "$rc"
+assert_contains "remote ls: empty → message"         "no remote sessions" "$out"
+
+# remote add
+run "$ATCH" remote add dns host-one.lab
+assert_exit     "remote add: exit 0"                 0 "$rc"
+assert_contains "remote add: confirmation"           "dns" "$out"
+if [ -f "$REG" ]; then ok "remote add: registry written"; else fail "remote add: registry written" "exists" "missing"; fi
+
+# remote ls shows the entry
+run "$ATCH" remote ls
+assert_exit     "remote ls: exit 0"                  0 "$rc"
+assert_contains "remote ls: shows name"              "dns" "$out"
+assert_contains "remote ls: shows host"              "host-one.lab" "$out"
+
+# remote add same name replaces (no duplicate, new host wins)
+run "$ATCH" remote add dns host-two.lab
+assert_exit     "remote add: replace → exit 0"       0 "$rc"
+run "$ATCH" remote ls
+assert_contains     "remote add: replace → new host"  "host-two.lab" "$out"
+assert_not_contains "remote add: replace → old gone"  "host-one.lab" "$out"
+
+# a second distinct entry coexists
+run "$ATCH" remote add build buildbox.lab
+run "$ATCH" remote ls
+assert_contains "remote ls: first entry"             "dns" "$out"
+assert_contains "remote ls: second entry"            "build" "$out"
+
+# remote rm
+run "$ATCH" remote rm dns
+assert_exit     "remote rm: exit 0"                  0 "$rc"
+assert_contains "remote rm: confirmation"            "removed" "$out"
+run "$ATCH" remote ls
+assert_not_contains "remote rm: entry gone"          "host-two.lab" "$out"
+assert_contains     "remote rm: other entry kept"    "buildbox.lab" "$out"
+
+# remote rm nonexistent
+run "$ATCH" remote rm __no_such_remote__
+assert_exit     "remote rm: missing → exit 1"        1 "$rc"
+assert_contains "remote rm: missing → message"       "no such remote" "$out"
+
+# remote add: wrong arg count → usage
+run "$ATCH" remote add only-name
+assert_exit     "remote add: bad args → exit 1"      1 "$rc"
+assert_contains "remote add: bad args → usage"       "usage" "$out"
+
+# remote rm: missing name → usage
+run "$ATCH" remote rm
+assert_exit     "remote rm: no name → exit 1"        1 "$rc"
+assert_contains "remote rm: no name → usage"         "usage" "$out"
+
+# remote: unknown subcommand
+run "$ATCH" remote frobnicate
+assert_exit     "remote: bad subcmd → exit 1"        1 "$rc"
+assert_contains "remote: bad subcmd → message"       "unknown subcommand" "$out"
+
+rm -f "$REG"
+
+# ── 25. no-args → usage ──────────────────────────────────────────────────────
 
 # Invoking with zero arguments calls usage() (exits 0, prints help).
 # We already consumed the binary name in main, so argc < 1 → usage().
@@ -923,6 +993,7 @@ assert_contains "help: shows rm command"             "rm" "$out"
 assert_contains "help: shows share command"          "share" "$out"
 assert_contains "help: shows join command"           "join" "$out"
 assert_contains "help: shows unshare command"        "unshare" "$out"
+assert_contains "help: shows remote command"         "remote" "$out"
 
 # ── summary ──────────────────────────────────────────────────────────────────
 
