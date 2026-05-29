@@ -91,6 +91,14 @@ test-ssh: build-docker
 		--platform linux/$(arch) $(IMAGE):$(arch) \
 		sh /src/tests/ssh-test.sh /src/build/atch
 
+# Cross-user sharing test: creates real users and drives the guest listener with
+# a tiny SO_PEERCRED connector, so it needs to run the container as root.
+.PHONY: test-share
+test-share: build-docker
+	docker run --rm -v "$$PWD":/src \
+		--platform linux/$(arch) $(IMAGE):$(arch) \
+		sh /src/tests/cross-share-test.sh /src/build/atch
+
 .PHONY: release
 release: man $(archs)
 
