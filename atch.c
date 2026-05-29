@@ -1,5 +1,6 @@
 #include "atch.h"
 #include <grp.h>
+#include <sys/utsname.h>
 
 /* Env-var name string, computed from progname at startup. */
 const char *session_envvar;
@@ -1185,18 +1186,101 @@ static int run_ssh(const char *host, const char *identity, int tty,
 	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
+/* Normalize a `uname -m` machine string to the release arch token. */
+static void norm_arch(const char *m, char *out, size_t n)
+{
+	if (!strcmp(m, "x86_64") || !strcmp(m, "amd64"))
+		snprintf(out, n, "amd64");
+	else if (!strcmp(m, "aarch64") || !strcmp(m, "arm64"))
+		snprintf(out, n, "arm64");
+	else
+		snprintf(out, n, "%s", m);
+}
+
+/* Read the remote host's `uname -m` (normalized) over the user's own ssh.
+** Runs before the dedicated key exists, so it uses default auth. 0 on success. */
+static int remote_arch(const char *host, char *arch, size_t n)
+{
+	char dir[512], cmd[1200], line[128];
+	FILE *p;
+	int ok = 0;
+
+	get_config_dir(dir, sizeof(dir));
+	snprintf(cmd, sizeof(cmd),
+		 "ssh -o UserKnownHostsFile='%s/known_hosts' "
+		 "-o StrictHostKeyChecking=accept-new '%s' uname -m 2>/dev/null",
+		 dir, host);
+	p = popen(cmd, "r");
+	if (!p)
+		return -1;
+	if (fgets(line, sizeof(line), p)) {
+		char *nl = strchr(line, '\n');
+
+		if (nl)
+			*nl = '\0';
+		if (*line) {
+			norm_arch(line, arch, n);
+			ok = 1;
+		}
+	}
+	pclose(p);
+	return ok ? 0 : -1;
+}
+
+/*
+** Choose which binary to stage onto `host`. Same architecture → our own binary
+** (/proc/self/exe). Different → a user-supplied static binary at
+** ~/.config/<prog>/<prog>-<arch>; if it's missing, refuse with guidance rather
+** than ship an unrunnable binary. Fills *binout and *archout. 0 to proceed.
+*/
+static int choose_stage_binary(const char *host, char *binout, size_t binsz,
+			       char *archout, size_t archsz)
+{
+	struct utsname u;
+	char larch[32];
+	const char *base;
+	char cfg[512];
+
+	if (remote_arch(host, archout, archsz) != 0) {
+		/* Detection failed (transient ssh issue) — fall back to self;
+		 ** a genuine connectivity problem surfaces in the next step. */
+		snprintf(archout, archsz, "%s", "?");
+		snprintf(binout, binsz, "/proc/self/exe");
+		return 0;
+	}
+	uname(&u);
+	norm_arch(u.machine, larch, sizeof(larch));
+	if (strcmp(larch, archout) == 0) {
+		snprintf(binout, binsz, "/proc/self/exe");
+		return 0;
+	}
+
+	base = strrchr(progname, '/');
+	base = base ? base + 1 : progname;
+	get_config_dir(cfg, sizeof(cfg));
+	snprintf(binout, binsz, "%s/%s-%s", cfg, base, archout);
+	if (access(binout, R_OK) == 0)
+		return 0;
+
+	printf("%s: %s is %s but this %s is %s.\n"
+	       "  Provide a matching static binary at %s\n"
+	       "  (build with 'make release' and copy the %s artifact there).\n",
+	       progname, host, archout, base, larch, binout, archout);
+	return -1;
+}
+
 /*
 ** First-contact bootstrap over the user's own ssh: install the dedicated key
-** with a restricted forced-command line (idempotent) and stage this very
-** binary into the remote ~/.cache/atch/atch. Returns 0 on success.
+** with a restricted forced-command line (idempotent) and stage `binpath` into
+** the remote ~/.cache/atch/atch. Returns 0 on success.
 */
-static int install_key_and_stage(const char *host, const char *keypath)
+static int install_key_and_stage(const char *host, const char *keypath,
+				 const char *binpath)
 {
-	char pubpath[680], self[512], setup[3072];
+	char pubpath[680], setup[3072];
 	char *pubkey, *blob, *sp;
 	FILE *pf;
 	size_t n;
-	ssize_t sl;
 	int rc;
 
 	/* Read our public key (single line). */
@@ -1244,14 +1328,8 @@ static int install_key_and_stage(const char *host, const char *keypath)
 		return -1;
 	}
 
-	/* Stage this binary. */
-	sl = readlink("/proc/self/exe", self, sizeof(self) - 1);
-	if (sl <= 0) {
-		printf("%s: cannot locate own binary to stage\n", progname);
-		return -1;
-	}
-	self[sl] = '\0';
-	rc = run_ssh(host, NULL, 0, self,
+	/* Stage the (arch-appropriate) binary. */
+	rc = run_ssh(host, NULL, 0, binpath,
 		     "cat > ~/.cache/atch/atch.tmp && "
 		     "chmod 755 ~/.cache/atch/atch.tmp && "
 		     "mv ~/.cache/atch/atch.tmp ~/.cache/atch/atch");
@@ -1328,9 +1406,15 @@ static int remote_main(const char *host, const char *name)
 		return 1;
 
 	if (bootstrap) {
+		char stagebin[600], rarch[32];
+
+		if (choose_stage_binary(target, stagebin, sizeof(stagebin),
+					rarch, sizeof(rarch)) != 0)
+			return 1;
 		if (!quiet)
-			printf("%s: bootstrapping %s ...\n", progname, target);
-		if (install_key_and_stage(target, keypath) != 0)
+			printf("%s: bootstrapping %s (%s) ...\n", progname,
+			       target, rarch);
+		if (install_key_and_stage(target, keypath, stagebin) != 0)
 			return 1;
 		if (pinned_fingerprint(target, fp, sizeof(fp)) == 0) {
 			if (have_reg && strcmp(e.fp, "-") != 0 &&

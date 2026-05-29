@@ -531,6 +531,16 @@ atch remote rm logs              # forget a mapping
 Using a dedicated key rather than your personal identity, locked to a forced
 command, keeps the blast radius to "can run atch on this host" if it ever leaks.
 
+**Architecture must match; kernel and distro don't.** `atch remote` ships your
+local binary as-is — it does not recompile on the far side. Because the binary
+is fully static, it runs on essentially any Linux kernel and distribution. The
+one thing that must line up is the CPU architecture. `atch` detects the remote's
+(`uname -m`) and, when it differs from yours (say an arm64 box from an x86_64
+workstation), stages a matching static binary from `~/.config/atch/<prog>-<arch>`
+(`amd64` / `arm64`) instead of itself; build the per-arch artifacts with `make
+release` and drop the right one there. If none is present it refuses up front
+with a clear message rather than shipping an unrunnable binary.
+
 Once you are attached, `atch` is on your `PATH` inside the session even on the
 remote host — the master prepends its own directory (e.g. `~/.cache/atch/`) to
 `PATH` for the session — so you can run `atch share`, `atch list`, and the other

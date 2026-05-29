@@ -138,6 +138,34 @@ esac
 BARE=$(timeout 15 "$ATCH" demo </dev/null 2>&1 || true)
 have "connecting to 'demo' on localhost" "$BARE" "bare-name: registered name routed remote"
 
+# ── 6. cross-arch auto-picker / guard ─────────────────────────────────────────
+# Shim the `uname` COMMAND so the remote reports a foreign arch over ssh. atch's
+# LOCAL arch comes from the uname() syscall, which this does not affect — so the
+# two differ and the picker engages.
+cat > /usr/bin/uname <<'SH'
+#!/bin/sh
+[ "$1" = "-m" ] && echo aarch64 || exec busybox uname "$@"
+SH
+chmod +x /usr/bin/uname
+
+# No matching binary present → refuse with guidance, stage nothing.
+rm -f /root/.config/atch/atch-arm64
+GUARD=$(timeout 20 "$ATCH" remote localhost crossarch </dev/null 2>&1 || true)
+case "$GUARD" in
+    *"is arm64"*|*"Provide a matching"*) ok "cross-arch: refuses without a matching binary" ;;
+    *) fail "cross-arch: refuses without a matching binary" "$GUARD" ;;
+esac
+
+# Supply a matching (distinguishable) binary → it gets staged instead of self.
+cp "$ATCH" /root/.config/atch/atch-arm64
+printf 'ARMMARKER' >> /root/.config/atch/atch-arm64
+timeout 20 "$ATCH" remote localhost crossarch2 </dev/null >/dev/null 2>&1 || true
+if cmp -s /root/.config/atch/atch-arm64 /root/.cache/atch/atch; then
+    ok "cross-arch: stages the supplied matching binary"
+else
+    fail "cross-arch: stages the supplied matching binary" "staged copy != supplied arm64 binary"
+fi
+
 printf "\n1..%d\n" "$T"
 printf "# %d passed, %d failed\n" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
