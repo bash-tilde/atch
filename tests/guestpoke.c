@@ -10,6 +10,7 @@
 ** in atch.h (type, len, 8-byte union) — 10 bytes on the wire.
 */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -47,7 +48,19 @@ int main(int argc, char **argv)
 	/* Let the master accept + authorize this connection first. */
 	usleep(300000);
 
-	if (argc >= 3) {
+	/* `--pkt TYPE LEN`: send one raw control packet (e.g. MSG_REDRAW=4 with
+	 ** len=REDRAW_WINCH=3) to test that read-only guests are gated. */
+	if (argc >= 5 && strcmp(argv[2], "--pkt") == 0) {
+		struct wire_packet p;
+
+		memset(&p, 0, sizeof(p));
+		p.type = (unsigned char)atoi(argv[3]);
+		p.len = (unsigned char)atoi(argv[4]);
+		if (write(s, &p, sizeof(p)) != (ssize_t) sizeof(p)) {
+			perror("write");
+			return 4;
+		}
+	} else if (argc >= 3) {
 		const char *msg = argv[2];
 		size_t off = 0, total = strlen(msg);
 

@@ -49,40 +49,33 @@ void guest_socket_path(char *buf, size_t size, unsigned uid, const char *name)
 }
 
 /*
-** Path where `share` stages a world-readable copy of the binary so a guest who
-** has no atch of their own can exec it by absolute path. The bootstrapped
-** binary lives in the owner's `~/.cache/<prog>/` which other users cannot
-** traverse, hence a separate world-readable copy. A root-owned session can use
-** /run (tmpfs, reboot-clean); everyone else falls back to /tmp, since creating
-** /run/<prog> needs privilege.
+** Stage a world-readable copy of our own binary so a guest with no atch of
+** their own can exec it by absolute path (the bootstrapped binary lives in the
+** owner's 0700 ~/.cache/<prog>/, which other users cannot traverse).
+**
+** `tmpl` is a mkstemp template like "/tmp/.<prog>-bin.<uid>.XXXXXX"; on success
+** it is rewritten in place to the actual (RANDOM, unguessable) path and the
+** copy is left mode 0755. Using mkstemp is the security-critical bit: it
+** creates the file with O_CREAT|O_EXCL and does not follow a pre-existing
+** symlink, so a hostile local user cannot pre-plant the (otherwise /tmp,
+** world-writable) name as a symlink to trick us into overwriting their file.
+** The random suffix also makes the final name unguessable. Returns 0 on
+** success; failure is non-fatal (guests that already have atch still work).
 */
-void guest_bin_path(char *buf, size_t size, unsigned uid)
+static int stage_self_mkstemp(char *tmpl, size_t tmplsz)
 {
-	const char *base = strrchr(progname, '/');
-
-	base = base ? base + 1 : progname;
-	if (geteuid() == 0)
-		snprintf(buf, size, "/run/%s/%s", base, base);
-	else
-		snprintf(buf, size, "/tmp/.%s-bin.%u", base, uid);
-}
-
-/*
-** Copy our own binary to `dest` (mode 0755) for guest_bin_path staging.
-** Atomic via a temp file + rename so a guest never execs a partial copy.
-** Returns 0 on success, -1 otherwise (caller treats failure as non-fatal).
-*/
-static int stage_self_to(const char *dest)
-{
-	char tmp[600], buf[65536];
+	char buf[65536];
 	int in, out;
 	ssize_t n;
+	mode_t old;
 
+	(void)tmplsz;
 	in = open("/proc/self/exe", O_RDONLY);
 	if (in < 0)
 		return -1;
-	snprintf(tmp, sizeof(tmp), "%s.tmp.%u", dest, (unsigned)getpid());
-	out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+	old = umask(0077);
+	out = mkstemp(tmpl);	/* random name, O_CREAT|O_EXCL|O_RDWR, no follow */
+	umask(old);
 	if (out < 0) {
 		close(in);
 		return -1;
@@ -91,16 +84,17 @@ static int stage_self_to(const char *dest)
 		if (write(out, buf, (size_t)n) != n) {
 			close(in);
 			close(out);
-			unlink(tmp);
+			unlink(tmpl);
 			return -1;
 		}
 	close(in);
-	close(out);
-	if (n < 0 || rename(tmp, dest) != 0) {
-		unlink(tmp);
+	if (n < 0) {
+		close(out);
+		unlink(tmpl);
 		return -1;
 	}
-	chmod(dest, 0755);
+	fchmod(out, 0755);	/* world-exec so a guest can run it; fd, not path */
+	close(out);
 	return 0;
 }
 
@@ -775,7 +769,9 @@ static int cmd_clear(int argc, char **argv)
 		return 1;
 	}
 	snprintf(log_path, sizeof(log_path), "%s.log", sockname);
-	fd = open(log_path, O_WRONLY | O_TRUNC);
+	/* O_NOFOLLOW: never truncate a symlink target if the log path was
+	 ** redirected (e.g. a session named as a path under a shared dir). */
+	fd = open(log_path, O_WRONLY | O_TRUNC | O_NOFOLLOW);
 	if (fd >= 0) {
 		close(fd);
 		if (!quiet)
@@ -929,8 +925,9 @@ static int cmd_rm(int argc, char **argv)
 }
 
 /* Default: atch <session> [cmd...] — attach-or-create */
-/* Remote bootstrap/attach orchestrator, defined below. */
+/* Remote bootstrap/attach orchestrator + host validator, defined below. */
 static int remote_main(const char *host, const char *name);
+static int valid_host(const char *h);
 
 static int cmd_open(char *session, int argc, char **argv)
 {
@@ -992,6 +989,10 @@ static int cmd_remote(int argc, char **argv)
 	if (!strcmp(argv[0], "add")) {
 		if (argc != 3) {
 			printf("usage: %s remote add <name> <host>\n", progname);
+			return 1;
+		}
+		if (!valid_host(argv[2])) {
+			printf("%s: invalid host '%s'\n", progname, argv[2]);
 			return 1;
 		}
 		if (registry_put(argv[1], argv[2], "-", "-") != 0) {
@@ -1085,6 +1086,10 @@ static int valid_host(const char *h)
 
 	if (!h || !*h)
 		return 0;
+	/* A leading '-' would be parsed by ssh as an option, not a host
+	 ** (e.g. -oProxyCommand=... / -F<file>) — i.e. argument injection. */
+	if (*h == '-')
+		return 0;
 	for (p = h; *p; p++) {
 		char c = *p;
 
@@ -1152,6 +1157,7 @@ static int run_ssh(const char *host, const char *identity, int tty,
 		argv[n++] = "-o";
 		argv[n++] = "IdentitiesOnly=yes";
 	}
+	argv[n++] = "--";	/* end of options: never treat host as a flag */
 	argv[n++] = (char *)host;
 	if (remote_cmd)
 		argv[n++] = (char *)remote_cmd;
@@ -1208,7 +1214,7 @@ static int remote_arch(const char *host, char *arch, size_t n)
 	get_config_dir(dir, sizeof(dir));
 	snprintf(cmd, sizeof(cmd),
 		 "ssh -o UserKnownHostsFile='%s/known_hosts' "
-		 "-o StrictHostKeyChecking=accept-new '%s' uname -m 2>/dev/null",
+		 "-o StrictHostKeyChecking=accept-new -- '%s' uname -m 2>/dev/null",
 		 dir, host);
 	p = popen(cmd, "r");
 	if (!p)
@@ -1351,7 +1357,7 @@ static int pinned_fingerprint(const char *host, char *fp, size_t size)
 
 	get_config_dir(dir, sizeof(dir));
 	snprintf(cmd, sizeof(cmd),
-		 "ssh-keygen -F %s -l -f '%s/known_hosts' 2>/dev/null", host,
+		 "ssh-keygen -F '%s' -l -f '%s/known_hosts' 2>/dev/null", host,
 		 dir);
 	p = popen(cmd, "r");
 	if (!p)
@@ -1601,24 +1607,35 @@ static int cmd_share(int argc, char **argv)
 		return 1;
 	}
 
+	/* Stage a world-readable copy of ourselves so a guest who doesn't have
+	 ** atch installed can still join by absolute path. The name is random and
+	 ** exclusively created (mkstemp) to defeat /tmp symlink attacks. Recorded
+	 ** in the .share descriptor (before notifying the master, so it reads the
+	 ** path and removes the copy on revoke/expiry). Best-effort: if it fails,
+	 ** guests that already have atch are unaffected. */
+	{
+		const char *base = strrchr(progname, '/');
+
+		base = base ? base + 1 : progname;
+		snprintf(gb, sizeof(gb), "/tmp/.%s-bin.%u.XXXXXX", base,
+			 (unsigned)getuid());
+		staged = (stage_self_mkstemp(gb, sizeof(gb)) == 0);
+	}
+	if (staged) {
+		FILE *sf = fopen(sharepath, "a");
+
+		if (sf) {
+			fprintf(sf, "bin %s\n", gb);
+			fclose(sf);
+		}
+	}
+
 	if (notify_master(MSG_SHARE) != 0) {
+		if (staged)
+			unlink(gb);
 		unlink(sharepath);
 		return 1;
 	}
-
-	/* Stage a world-readable copy of ourselves so a guest who doesn't have
-	 ** atch installed can still join by absolute path. Best-effort: if it
-	 ** fails, guests that already have atch are unaffected. */
-	guest_bin_path(gb, sizeof(gb), (unsigned)getuid());
-	if (geteuid() == 0) {
-		const char *base = strrchr(progname, '/');
-		char dir[280];
-
-		base = base ? base + 1 : progname;
-		snprintf(dir, sizeof(dir), "/run/%s", base);
-		mkdir(dir, 0755);
-	}
-	staged = (stage_self_to(gb) == 0);
 
 	if (!quiet) {
 		guest_socket_path(gp, sizeof(gp), (unsigned)getuid(),

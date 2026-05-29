@@ -81,6 +81,7 @@ static struct grant grants[MAX_GRANTS];
 static int ngrants;
 static int guest_fd = -1;		/* guest listener, -1 when not sharing */
 static char guest_path[256];		/* filesystem path of the guest socket */
+static char guest_bin[256];		/* staged guest binary copy, "" if none */
 static time_t share_expiry;		/* absolute expiry; 0 = no expiry */
 
 /* Append an audit line to the on-disk session log (best-effort). */
@@ -205,6 +206,8 @@ static void cleanup_session(void)
 	}
 	if (guest_path[0])
 		unlink(guest_path);
+	if (guest_bin[0])
+		unlink(guest_bin);
 	unlink(sockname);
 }
 
@@ -282,6 +285,16 @@ static void add_self_to_path(void)
 	if (!slash || slash == exe)
 		return;
 	*slash = '\0';		/* exe is now the directory */
+
+	/* Never prepend a directory other users can write to (e.g. the staged
+	 ** guest binary under /tmp): doing so would let any local user plant a
+	 ** binary that the session's child shell runs ahead of the real one. */
+	{
+		struct stat ds;
+
+		if (stat(exe, &ds) < 0 || (ds.st_mode & (S_IWGRP | S_IWOTH)))
+			return;
+	}
 
 	path = getenv("PATH");
 	if (!path || !*path) {
@@ -509,6 +522,10 @@ static void revoke_share(void)
 	guest_fd = -1;
 	if (guest_path[0])
 		unlink(guest_path);
+	if (guest_bin[0]) {
+		unlink(guest_bin);
+		guest_bin[0] = '\0';
+	}
 	drop_guest_clients();
 	ngrants = 0;
 	share_expiry = 0;
@@ -526,6 +543,7 @@ static void load_share(void)
 	char path[600];
 	FILE *f;
 	char line[128];
+	char newbin[256] = "";
 	int n_rw = 0;
 
 	snprintf(path, sizeof(path), "%s.share", sockname);
@@ -542,6 +560,8 @@ static void load_share(void)
 
 		if (sscanf(line, "expiry %ld", &e) == 1) {
 			share_expiry = (time_t) e;
+		} else if (sscanf(line, "bin %255s", newbin) == 1) {
+			/* staged guest-binary path, recorded by `atch share` */
 		} else if (sscanf(line, "uid %u %d", &id, &w) == 2 &&
 			   ngrants < MAX_GRANTS) {
 			grants[ngrants].is_group = 0;
@@ -559,6 +579,14 @@ static void load_share(void)
 		}
 	}
 	fclose(f);
+
+	/* Adopt the staged guest-binary path; drop a previous copy if it changed
+	 ** (e.g. on re-share) so /tmp copies don't accumulate. */
+	if (newbin[0]) {
+		if (guest_bin[0] && strcmp(guest_bin, newbin) != 0)
+			unlink(guest_bin);
+		snprintf(guest_bin, sizeof(guest_bin), "%s", newbin);
+	}
 
 	if (ngrants == 0) {
 		revoke_share();
@@ -852,15 +880,23 @@ static void client_activity(struct client *p)
 	} else if (pkt.type == MSG_DETACH)
 		p->attached = 0;
 
-	/* Window size change request, without a forced redraw. */
+	/* Window size change request, without a forced redraw. Read-only guests
+	 ** may not resize the shared pty (it would resize the owner's program). */
 	else if (pkt.type == MSG_WINCH) {
-		the_pty.ws = pkt.u.ws;
-		ioctl(the_pty.fd, TIOCSWINSZ, &the_pty.ws);
+		if (!p->read_only) {
+			the_pty.ws = pkt.u.ws;
+			ioctl(the_pty.fd, TIOCSWINSZ, &the_pty.ws);
+		}
 	}
 
-	/* Force a redraw using a particular method. */
+	/* Force a redraw using a particular method. Denied for read-only guests:
+	 ** it mutates the shared pty (resize, ^L into the program's input, or a
+	 ** SIGWINCH to the child) — all forms of injection a watcher must not do. */
 	else if (pkt.type == MSG_REDRAW) {
 		int method = pkt.len;
+
+		if (p->read_only)
+			return;
 
 		/* If the client didn't specify a particular method, use
 		 ** whatever we had on startup. */

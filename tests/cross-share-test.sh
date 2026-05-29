@@ -37,9 +37,16 @@ A=$(id -u alice); C=$(id -u carol); D=$(id -u dave); B=$(id -u bob)
 
 # helper: connect to the guest socket as a user, optional push string
 poke() { su "$1" -c "/tmp/guestpoke '$GS' ${2:+'$2'}" >/dev/null 2>&1; }
+# helper: connect and send one raw control packet (type len), e.g. MSG_REDRAW 4 / REDRAW_WINCH 3
+poke_pkt() { su "$1" -c "/tmp/guestpoke '$GS' --pkt $2 $3" >/dev/null 2>&1; }
 
-# ── owner starts a shared `cat` session ──────────────────────────────────────
-"$ATCH" start demo cat
+# ── owner starts a shared session ─────────────────────────────────────────────
+# Background `cat` echoes pushed input into the log; a short-sleep foreground
+# loop keeps the shell responsive so the SIGWINCH trap actually runs (POSIX
+# defers traps while a foreground utility like `cat` is blocked) — the trap
+# echoes a marker so we can observe whether a guest's MSG_REDRAW(WINCH) reached
+# the program.
+"$ATCH" start demo sh -c 'trap "echo GOTWINCH" 28; cat & while :; do sleep 0.2; done'
 i=0; while [ $i -lt 20 ] && [ ! -S /root/.cache/atch/demo ]; do sleep 0.1; i=$((i+1)); done
 
 # alice read-only (default), carol read-write, @atchteam read-only; bob excluded
@@ -50,13 +57,16 @@ i=0; while [ $i -lt 20 ] && [ ! -S "$GS" ]; do sleep 0.1; i=$((i+1)); done
 if [ -S "$GS" ]; then ok "share: guest listener present"; else fail "share: guest listener present"; fi
 
 # ── staged guest binary: a guest with no atch can exec it by absolute path ────
-# Owner is root here, so it lands at /run/atch/atch (the /run path); a non-root
-# owner would get /tmp/.atch-bin.<uid>.
-STAGED=/run/atch/atch
-if [ -x "$STAGED" ]; then ok "stage: guest binary present at $STAGED"; else fail "stage: guest binary present" "$STAGED missing"; fi
-has "$STAGED join demo" "$SH" "stage: share output prints the binless-guest command"
+# Now a RANDOM, exclusively-created /tmp name (defeats symlink/TOCTOU). The exact
+# path is unguessable, so we read it from the share output.
+STAGED=$(printf '%s\n' "$SH" | grep -oE '/tmp/\.atch-bin\.[0-9]+\.[A-Za-z0-9]+' | head -1)
+if [ -n "$STAGED" ] && [ -x "$STAGED" ]; then
+    ok "stage: guest binary staged at a random /tmp path ($STAGED)"
+else
+    fail "stage: guest binary staged at a random /tmp path" "got '$STAGED'"
+fi
 # a different, unprivileged user can actually execute the staged copy
-if su bob -c "$STAGED --version" >/dev/null 2>&1; then
+if [ -n "$STAGED" ] && su bob -c "$STAGED --version" >/dev/null 2>&1; then
     ok "stage: ungranted-but-binless user can exec the staged copy"
 else
     fail "stage: ungranted user can exec the staged copy"
@@ -82,10 +92,22 @@ SESS=$(cat "$LOG" 2>/dev/null)
 has    "RWPASS" "$SESS" "read-write guest: keystrokes reach the session"
 hasnot "RODROP" "$SESS" "read-only guest: keystrokes are dropped"
 
-# ── 3. unshare drops the listener; a former guest can no longer connect ───────
+# ── 2b. read-only guests cannot redraw/resize/signal the shared pty (H2) ──────
+# MSG_REDRAW(4) with REDRAW_WINCH(3) makes the master SIGWINCH the program. The
+# trap echoes GOTWINCH. A read-only guest must NOT trigger it; a read-write one
+# may. Do read-only first and confirm no marker, then read-write and confirm it.
+poke_pkt alice 4 3
+sleep 0.5
+hasnot "GOTWINCH" "$(cat "$LOG" 2>/dev/null)" "read-only guest: MSG_REDRAW/WINCH dropped"
+poke_pkt carol 4 3
+sleep 0.5
+has    "GOTWINCH" "$(cat "$LOG" 2>/dev/null)" "read-write guest: MSG_REDRAW/WINCH delivered"
+
+# ── 3. unshare drops the listener + staged binary; a former guest can't connect ─
 "$ATCH" unshare demo >/dev/null 2>&1
 i=0; while [ $i -lt 20 ] && [ -S "$GS" ]; do sleep 0.1; i=$((i+1)); done
 if [ ! -S "$GS" ]; then ok "unshare: guest listener gone"; else fail "unshare: guest listener gone"; fi
+if [ -n "$STAGED" ] && [ ! -e "$STAGED" ]; then ok "unshare: staged guest binary removed"; else fail "unshare: staged guest binary removed" "$STAGED still present"; fi
 poke alice
 RC_AFTER=$(su alice -c "/tmp/guestpoke '$GS'" 2>&1; echo $?)
 case "$RC_AFTER" in *3) ok "unshare: connect refused after revoke" ;; *) fail "unshare: connect refused after revoke" "$RC_AFTER" ;; esac

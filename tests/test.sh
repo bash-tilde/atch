@@ -982,6 +982,17 @@ run "$ATCH" remote 192.0.2.1 somesession
 assert_exit     "remote <host> <session>: recognized (exit 1, no ssh here)" 1 "$rc"
 assert_not_contains "remote <host> <session>: not a usage error" "usage" "$out"
 
+# security: a leading-dash host must be rejected (ssh option-injection guard),
+# never reaching ssh
+run "$ATCH" remote -oProxyCommand=x evilsess
+assert_exit     "remote: leading-dash host → exit 1"  1 "$rc"
+assert_contains "remote: leading-dash host rejected"  "invalid remote host" "$out"
+
+# security: a leading-dash host is also rejected at registry-write time
+run "$ATCH" remote add evil -Fmalice
+assert_exit     "remote add: leading-dash host → exit 1" 1 "$rc"
+assert_contains "remote add: leading-dash host rejected"  "invalid host" "$out"
+
 rm -f "$REG"
 
 # ── 25. atch is on PATH inside a session ─────────────────────────────────────
