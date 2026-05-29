@@ -531,6 +531,12 @@ atch remote rm logs              # forget a mapping
 Using a dedicated key rather than your personal identity, locked to a forced
 command, keeps the blast radius to "can run atch on this host" if it ever leaks.
 
+Once you are attached, `atch` is on your `PATH` inside the session even on the
+remote host — the master prepends its own directory (e.g. `~/.cache/atch/`) to
+`PATH` for the session — so you can run `atch share`, `atch list`, and the other
+subcommands directly from the remote shell without spelling out the full path to
+the binary.
+
 ## Backward compatibility
 
 The original flag-based syntax is still supported:

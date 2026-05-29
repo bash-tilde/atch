@@ -984,7 +984,20 @@ assert_not_contains "remote <host> <session>: not a usage error" "usage" "$out"
 
 rm -f "$REG"
 
-# ── 25. no-args → usage ──────────────────────────────────────────────────────
+# ── 25. atch is on PATH inside a session ─────────────────────────────────────
+# The master prepends its own binary's directory to the child's PATH, so `atch`
+# resolves from inside a session even when the binary lives off PATH (e.g. a
+# remote host where it was staged into ~/.cache/atch/). Here the test binary is
+# run by absolute path and its dir is not otherwise on PATH.
+"$ATCH" start s-path sh -c 'command -v atch >/dev/null && echo ATCH_ON_PATH || echo ATCH_MISSING; sleep 300'
+sleep 0.3
+run "$ATCH" tail s-path
+assert_contains "session: atch resolvable on PATH"   "ATCH_ON_PATH" "$out"
+assert_not_contains "session: atch not missing"      "ATCH_MISSING" "$out"
+tidy s-path
+rm -f "$HOME/.cache/atch/s-path.log"
+
+# ── 26. no-args → usage ──────────────────────────────────────────────────────
 
 # Invoking with zero arguments calls usage() (exits 0, prints help).
 # We already consumed the binary name in main, so argc < 1 → usage().

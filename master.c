@@ -243,6 +243,61 @@ static int setnonblocking(int fd)
 #endif
 }
 
+/* True if `dir` is already a (whole) element of the colon-separated `path`. */
+static int dir_on_path(const char *dir, const char *path)
+{
+	size_t dlen = strlen(dir);
+	const char *p = path;
+
+	while (p && *p) {
+		const char *end = strchr(p, ':');
+		size_t seg = end ? (size_t) (end - p) : strlen(p);
+
+		if (seg == dlen && strncmp(p, dir, dlen) == 0)
+			return 1;
+		if (!end)
+			break;
+		p = end + 1;
+	}
+	return 0;
+}
+
+/*
+** Prepend the directory holding our own binary to PATH (for the child env), so
+** `atch` resolves from inside a session even when the binary lives somewhere
+** off PATH — e.g. a remote host where it was staged into ~/.cache/<prog>/.
+** Idempotent: skips if the directory is already on PATH (the local case).
+*/
+static void add_self_to_path(void)
+{
+	char exe[512];
+	ssize_t el = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+	char *slash;
+	const char *path;
+
+	if (el <= 0)
+		return;
+	exe[el] = '\0';
+	slash = strrchr(exe, '/');
+	if (!slash || slash == exe)
+		return;
+	*slash = '\0';		/* exe is now the directory */
+
+	path = getenv("PATH");
+	if (!path || !*path) {
+		setenv("PATH", exe, 1);
+	} else if (!dir_on_path(exe, path)) {
+		size_t len = strlen(exe) + 1 + strlen(path) + 1;
+		char *np = malloc(len);
+
+		if (np) {
+			snprintf(np, len, "%s:%s", exe, path);
+			setenv("PATH", np, 1);
+			free(np);
+		}
+	}
+}
+
 /* Initialize the pty structure. */
 static int init_pty(char **argv, int statusfd)
 {
@@ -279,6 +334,7 @@ static int init_pty(char **argv, int statusfd)
 				setenv(SESSION_ENVVAR, sockname, 1);
 			}
 		}
+		add_self_to_path();
 		execvp(*argv, argv);
 
 		/* Report the error to statusfd if we can, or stdout if we
