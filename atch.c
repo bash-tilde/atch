@@ -1132,12 +1132,14 @@ static int ensure_identity_key(char *keypath, size_t size)
 ** none, 1 = -t, 2 = -tt. stdin_path != NULL feeds the remote command's stdin
 ** from that file. remote_cmd is sent verbatim (NULL = interactive shell). All
 ** sessions use a private known_hosts with accept-new (TOFU + change refusal).
+** mux != 0 shares one authenticated connection across calls (ControlMaster),
+** so a password-auth bootstrap prompts once instead of per ssh invocation.
 ** Returns the ssh exit status, or -1 on spawn failure.
 */
 static int run_ssh(const char *host, const char *identity, int tty,
-		   const char *stdin_path, const char *remote_cmd)
+		   const char *stdin_path, const char *remote_cmd, int mux)
 {
-	char dir[512], khopt[640];
+	char dir[512], khopt[640], cmopt[640];
 	char *argv[24];
 	int n = 0, status, infd = -1;
 	pid_t pid;
@@ -1150,6 +1152,21 @@ static int run_ssh(const char *host, const char *identity, int tty,
 	argv[n++] = khopt;
 	argv[n++] = "-o";
 	argv[n++] = "StrictHostKeyChecking=accept-new";
+	if (mux) {
+		/* Reuse one authenticated connection across the bootstrap's ssh
+		 ** calls. The first opens the master; the rest ride its socket,
+		 ** so password auth is entered once. The socket lives in our
+		 ** private 0700 config dir; %C is a host/port/user hash so
+		 ** distinct targets never collide. ControlPersist lets the
+		 ** master linger briefly between calls, then it self-closes. */
+		snprintf(cmopt, sizeof(cmopt), "ControlPath=%s/mux-%%C", dir);
+		argv[n++] = "-o";
+		argv[n++] = "ControlMaster=auto";
+		argv[n++] = "-o";
+		argv[n++] = cmopt;
+		argv[n++] = "-o";
+		argv[n++] = "ControlPersist=30";
+	}
 	argv[n++] = (tty == 2) ? "-tt" : (tty == 1) ? "-t" : "-T";
 	if (identity) {
 		argv[n++] = "-i";
@@ -1204,18 +1221,23 @@ static void norm_arch(const char *m, char *out, size_t n)
 }
 
 /* Read the remote host's `uname -m` (normalized) over the user's own ssh.
-** Runs before the dedicated key exists, so it uses default auth. 0 on success. */
+** Runs before the dedicated key exists, so it uses default auth. This is the
+** first contact of a bootstrap, so it opens the shared ControlMaster the
+** following install/stage ssh calls reuse — password auth is entered once for
+** the whole bootstrap rather than per connection. 0 on success. */
 static int remote_arch(const char *host, char *arch, size_t n)
 {
-	char dir[512], cmd[1200], line[128];
+	char dir[512], cmd[1600], line[128];
 	FILE *p;
 	int ok = 0;
 
 	get_config_dir(dir, sizeof(dir));
 	snprintf(cmd, sizeof(cmd),
 		 "ssh -o UserKnownHostsFile='%s/known_hosts' "
-		 "-o StrictHostKeyChecking=accept-new -- '%s' uname -m 2>/dev/null",
-		 dir, host);
+		 "-o StrictHostKeyChecking=accept-new "
+		 "-o ControlMaster=auto -o ControlPath='%s/mux-%%C' "
+		 "-o ControlPersist=30 -- '%s' uname -m 2>/dev/null",
+		 dir, dir, host);
 	p = popen(cmd, "r");
 	if (!p)
 		return -1;
@@ -1328,7 +1350,7 @@ static int install_key_and_stage(const char *host, const char *keypath,
 		 blob, pubkey);
 	free(pubkey);
 
-	rc = run_ssh(host, NULL, 0, NULL, setup);
+	rc = run_ssh(host, NULL, 0, NULL, setup, 1);
 	if (rc != 0) {
 		printf("%s: key install failed (ssh exit %d)\n", progname, rc);
 		return -1;
@@ -1338,13 +1360,28 @@ static int install_key_and_stage(const char *host, const char *keypath,
 	rc = run_ssh(host, NULL, 0, binpath,
 		     "cat > ~/.cache/atch/atch.tmp && "
 		     "chmod 755 ~/.cache/atch/atch.tmp && "
-		     "mv ~/.cache/atch/atch.tmp ~/.cache/atch/atch");
+		     "mv ~/.cache/atch/atch.tmp ~/.cache/atch/atch", 1);
 	if (rc != 0) {
 		printf("%s: binary staging failed (ssh exit %d)\n", progname,
 		       rc);
 		return -1;
 	}
 	return 0;
+}
+
+/* Close the shared bootstrap ControlMaster so a password-authenticated
+** connection does not linger past the work that needed it. Best-effort: if no
+** master is open, ssh just reports no control path and exits nonzero, which we
+** ignore. Output is discarded so it never clutters the bootstrap log. */
+static void mux_stop(const char *host)
+{
+	char dir[512], cmd[1400];
+
+	get_config_dir(dir, sizeof(dir));
+	snprintf(cmd, sizeof(cmd),
+		 "ssh -o ControlPath='%s/mux-%%C' -O exit -- '%s' "
+		 ">/dev/null 2>&1", dir, host);
+	(void)system(cmd);	/* best-effort; nothing actionable on failure */
 }
 
 /* Read the pinned host's SHA256 fingerprint from our known_hosts (after a
@@ -1440,6 +1477,10 @@ static int remote_main(const char *host, const char *name)
 			       progname);
 		if (!quiet)
 			printf("%s: host '%s' bootstrapped\n", progname, target);
+		/* Done with first-contact auth; drop the shared master rather
+		 ** than leave it open. The key-based attach below is a separate,
+		 ** unmultiplexed connection. */
+		mux_stop(target);
 	}
 
 	/* Attaching needs a terminal, exactly like a local session. When there
@@ -1453,7 +1494,7 @@ static int remote_main(const char *host, const char *name)
 
 	/* Forced command runs `atch --relay`; it reads SSH_ORIGINAL_COMMAND
 	 ** (the name we send) and execs `atch <name>` on the remote. */
-	return run_ssh(target, keypath, 2, NULL, name) == 0 ? 0 : 1;
+	return run_ssh(target, keypath, 2, NULL, name, 0) == 0 ? 0 : 1;
 }
 
 /*
